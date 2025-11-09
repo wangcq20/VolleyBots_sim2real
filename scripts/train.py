@@ -21,11 +21,11 @@ from volley_bots import CONFIG_PATH, init_simulation_app
 from volley_bots.learning import HAPPOPolicy, MADDPGPolicy, MAPPOPolicy, MATPolicy, QMIXPolicy, DQNPolicy, SACPolicy, TD3Policy
 from volley_bots.utils.torchrl import AgentSpec, SyncDataCollector
 from volley_bots.utils.torchrl.transforms import (
-    FromDiscreteAction,
-    FromMultiDiscreteAction,
-    History,
     LogOnEpisode,
+    FromMultiDiscreteAction,
+    FromDiscreteAction,
     ravel_composite,
+    History,
 )
 from volley_bots.utils.wandb import init_wandb
 
@@ -157,7 +157,7 @@ def main(cfg: DictConfig):
     transforms = [InitTracker(), logger]
 
     # optionally discretize the action space or use a controller
-    action_transform: str = cfg.algo.get("action_transform", None)
+    action_transform: str = cfg.task.get("action_transform", None)
     print("action_transform", action_transform)
     if action_transform is not None:
         if action_transform.startswith("multidiscrete"):
@@ -174,6 +174,12 @@ def main(cfg: DictConfig):
             from volley_bots.utils.torchrl.transforms import PIDRateController
             controller = _PIDRateController(cfg.sim.dt, 9.81, base_env.drone.params).to(base_env.device)
             transform = PIDRateController(controller)
+            transforms.append(transform)
+        elif action_transform == "PIDrate_FM":
+            from volley_bots.controllers import PID_controller_flightmare as _PID_controller_flightmare
+            from volley_bots.utils.torchrl.transforms import PIDRateController_flightmare
+            controller = _PID_controller_flightmare(cfg.sim.dt, base_env.drone.params, base_env.device).to(base_env.device)
+            transform = PIDRateController_flightmare(controller)
             transforms.append(transform)
         else:
             raise NotImplementedError(f"Unknown action transform: {action_transform}")

@@ -1,31 +1,53 @@
-from collections import defaultdict
-from collections.abc import Callable
-from dataclasses import replace
-from typing import Any, Dict, Optional, Sequence, Tuple, Union
+# MIT License
+# 
+# Copyright (c) 2023 Botian Xu, Tsinghua University
+# 
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+# 
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+# 
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
-import numpy as np
-import torch
-from tensordict.tensordict import TensorDict, TensorDictBase
+from collections.abc import Callable
+from collections import defaultdict
+from typing import Any, Dict, Optional, Sequence, Union, Tuple
+
 from tensordict.utils import NestedKey
-from torchrl.data import (
-    BoundedTensorSpec,
-    CompositeSpec,
-    DiscreteTensorSpec,
-    MultiDiscreteTensorSpec,
-    TensorSpec,
-    UnboundedContinuousTensorSpec,
-)
+
+import torch
+import numpy as np
+from tensordict.tensordict import TensorDictBase, TensorDict
 from torchrl.data.tensor_specs import TensorSpec
 from torchrl.envs.common import EnvBase
 from torchrl.envs.transforms import (
-    CatTensors,
+    TransformedEnv,
+    Transform,
     Compose,
     FlattenObservation,
-    Transform,
-    TransformedEnv,
+    CatTensors,
 )
-
+from torchrl.data import (
+    TensorSpec,
+    BoundedTensorSpec,
+    UnboundedContinuousTensorSpec,
+    DiscreteTensorSpec,
+    MultiDiscreteTensorSpec,
+    CompositeSpec,
+)
 from .env import AgentSpec
+from dataclasses import replace
 
 
 def _transform_agent_spec(self: Transform, agent_spec: AgentSpec) -> AgentSpec:
@@ -51,11 +73,10 @@ def _agent_spec(self: TransformedEnv) -> AgentSpec:
 
 TransformedEnv.agent_spec = property(_agent_spec)
 
-import logging
-import os
-
 import h5py
 import numpy as np
+import os
+import logging
 
 
 def append_to_h5(filename, data_dict: Dict[str, Optional[np.ndarray]]):
@@ -185,7 +206,7 @@ class LogOnFirstEpisode(Transform):
         return tensordict
 
     def _log(self):
-        if len(self.stats) == 0:
+        if len(self.stats)==0:
             return
         stats: TensorDictBase = torch.stack(self.stats)
         dict_to_log = {}
@@ -251,9 +272,7 @@ class LogOnEpisode(Transform):
         self.n_episodes = n_episodes
         self.logger_func = logger_func
 
-        self.process_func = defaultdict(
-            lambda: lambda x: torch.nanmean(x.float()).item()
-        )
+        self.process_func = defaultdict(lambda: lambda x: torch.nanmean(x.float()).item())
         if process_func is not None:
             self.process_func.update(process_func)
 
@@ -272,7 +291,7 @@ class LogOnEpisode(Transform):
             )
         if _reset.any():
             # pdb.set_trace()
-            _reset = _reset.all(-1).cpu()  # [num_envs,]
+            _reset = _reset.all(-1).cpu() # [num_envs,]
             rst_tensordict = next_tensordict.select(*self.in_keys).cpu()
             self.stats.extend(rst_tensordict[_reset].unbind(0))
             if len(self.stats) >= self.n_episodes:
@@ -290,11 +309,13 @@ class LogOnEpisode(Transform):
                 # skip None
                 if self.training:
                     dict_to_log = {
-                        f"train/{k}": v for k, v in dict_to_log.items() if v is not None
+                        (k if k.startswith("reward/") else f"train/{k}"): v 
+                        for k, v in dict_to_log.items() if v is not None
                     }
                 else:
                     dict_to_log = {
-                        f"eval/{k}": v for k, v in dict_to_log.items() if v is not None
+                        (k if k.startswith("reward/") else f"eval/{k}"): v 
+                         for k, v in dict_to_log.items() if v is not None
                     }
 
                 if self.logger_func is not None:
@@ -452,7 +473,6 @@ def ravel_composite(
     else:
         raise TypeError
 
-
 class PosController(Transform):
     def __init__(
         self,
@@ -462,30 +482,26 @@ class PosController(Transform):
         super().__init__([], in_keys_inv=[("info", "drone_state")])
         self.controller = controller
         self.action_key = action_key
-
+    
     def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
         action_spec = input_spec[("full_action_spec", *self.action_key)]
-        spec = UnboundedContinuousTensorSpec(
-            action_spec.shape[:-1] + (7,), device=action_spec.device
-        )
+        spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1]+(7,), device=action_spec.device)
         input_spec[("full_action_spec", *self.action_key)] = spec
         return input_spec
-
+    
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
         drone_state = tensordict[("info", "drone_state")][..., :13]
         action = tensordict[self.action_key]
         target_pos, target_vel, target_yaw = action.split([3, 3, 1], -1)
         cmds = self.controller(
-            drone_state,
-            target_pos=target_pos
-            - drone_state[..., :3],  # using relative position to learn
-            target_vel=target_vel,
-            target_yaw=target_yaw * torch.pi,
+            drone_state, 
+            target_pos=target_pos-drone_state[..., :3],    # using relative position to learn
+            target_vel=target_vel, 
+            target_yaw=target_yaw*torch.pi
         )
-        torch.nan_to_num_(cmds, 0.0)
+        torch.nan_to_num_(cmds, 0.)
         tensordict.set(self.action_key, cmds)
         return tensordict
-
 
 class VelController(Transform):
     def __init__(
@@ -567,80 +583,128 @@ class PIDRateController(Transform):
         self.use_cbf = self.controller.use_cbf
         self.epsilon = self.controller.epsilon
         # self.tanh = TanhTransform()
-
+    
     def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
         action_spec = input_spec[("full_action_spec", *self.action_key)]
         spec = UnboundedContinuousTensorSpec(
-            action_spec.shape[:-1] + (4,), device=action_spec.device
+            action_spec.shape[: -1] + (4,), device=action_spec.device
         )
         input_spec[("full_action_spec", *self.action_key)] = spec
         return input_spec
-
+    
     def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
         drone_state = tensordict[("info", "drone_state")][..., :13]
-        action = tensordict[self.action_key]
+        action = tensordict[self.action_key] # RL policy output
         device = drone_state.device
-
+        
         # if not(self.epsilon is None) and self.use_cbf:
         #     action = solve_qp_batch(action.to('cpu').numpy(), prev_action.to('cpu').numpy(), self.epsilon)
         #     action = torch.from_numpy(action).to(device).float()
 
-        # target CTBR:
-        # target_rate: [-1, 1]
-        # target_thrust: [0, max_thrust_ratio]
-        action = torch.tanh(action)
-        target_rate, target_thrust = action.split([3, 1], -1)
-        target_thrust = torch.clamp(
-            (target_thrust + 1) / 2, min=0.0, max=self.max_thrust_ratio
-        )
+        action = torch.tanh(action) # [-1, 1]
+
+        target_rate, target_thrust = action.split([3, 1], -1) # [-1, 1]
+        target_thrust = torch.clamp((target_thrust + 1) / 2, min = 0.0, max = self.max_thrust_ratio) # [0, 1]
         if self.fixed_yaw:
             target_rate[..., 2] = 0.0
 
         # raw action error
-        ctbr_action = torch.concat([target_rate, target_thrust], dim=-1)
+        ctbr_action = torch.concat([target_rate, target_thrust], dim=-1) # target_rate: [-1, 1], target_thrust: [0, 1]
 
         prev_ctbr_action = tensordict[("info", "prev_action")]
         prev_prev_ctbr_action = tensordict[("info", "prev_prev_action")]
 
         # action smoothness
-        if not (self.epsilon is None) and self.use_action_smooth:
-            ctbr_action = prev_ctbr_action + torch.clamp(
-                ctbr_action - prev_ctbr_action, min=-self.epsilon, max=+self.epsilon
-            )
+        if not(self.epsilon is None) and self.use_action_smooth:
+            ctbr_action = prev_ctbr_action + torch.clamp(ctbr_action - prev_ctbr_action, min = - self.epsilon, max = + self.epsilon)        
             target_rate, target_thrust = ctbr_action.split([3, 1], -1)
 
-        action_error = torch.norm(ctbr_action - prev_ctbr_action, dim=-1)
+        action_error = torch.norm(ctbr_action - prev_ctbr_action, dim = -1)
         tensordict.set(("stats", "action_error_order1"), action_error)
-        action_error_2 = torch.norm(
-            prev_prev_ctbr_action + ctbr_action - 2 * prev_ctbr_action, dim=-1
-        )
+        action_error_2 = torch.norm(prev_prev_ctbr_action + ctbr_action - 2 * prev_ctbr_action, dim = -1)
         tensordict.set(("stats", "action_error_order2"), action_error_2)
         # update prev_action = current ctbr_action
         tensordict.set(("info", "prev_action"), ctbr_action)
         # update prev_prev_action =  prev_ctbr_action
         tensordict.set(("info", "prev_prev_action"), prev_ctbr_action)
-
+        
         # scale
         # target_rate: [-180, 180] degree/s
         # target_thrust: [0, 2^16]
         target_rate = target_rate * 180.0 * self.target_clip
         target_thrust = target_thrust * 2**16
 
-        # current rotors cmds and CTBR
+        # current rotors cmds and real CTBR
         cmds, ctbr = self.controller(
-            drone_state,
+            drone_state, 
             target_rate=target_rate,
             target_thrust=target_thrust,
-            reset_pid=tensordict["done"].expand(
-                -1, drone_state.shape[1]
-            ),  # num_drones: drone_state.shape[1]
+            reset_pid=tensordict['done'].expand(-1, drone_state.shape[1]) # num_drones: drone_state.shape[1]
         )
-        torch.nan_to_num_(cmds, 0.0)
-        tensordict.set(self.action_key, cmds)
-        tensordict.set("ctbr", ctbr)
-        tensordict.set("target_rate", target_rate)
-        tensordict.set("target_thrust", target_thrust)
-        # import pdb; pdb.set_trace()
+        torch.nan_to_num_(cmds, 0.)
+        tensordict.set(self.action_key, cmds) # the input to the base environment after the action transformation
+        tensordict.set('ctbr', ctbr)
+        tensordict.set('target_rate', target_rate)
+        tensordict.set('target_thrust', target_thrust)
+
+        return tensordict
+    
+
+class PIDRateController_flightmare(Transform):
+    def __init__(
+        self,
+        controller,
+        action_keys: list[Tuple[str, str]] = [("agents", "action")], 
+    ):
+        super().__init__([], in_keys_inv=[("info", "drone_state")])
+        self.controller = controller
+        self.action_keys = action_keys
+    
+    def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
+        for key in self.action_keys:
+            action_spec = input_spec[("full_action_spec", *key)]
+            spec = UnboundedContinuousTensorSpec(action_spec.shape[:-1] + (4,), device=action_spec.device)
+            input_spec[("full_action_spec", *key)] = spec
+        return input_spec
+    
+    def _inv_call(self, tensordict: TensorDictBase) -> TensorDictBase:
+        drone_state = tensordict[("info", "drone_state")][..., :13]
+        for key in self.action_keys:
+            action = tensordict[key]
+
+            action = torch.tanh(action)
+            # action: [-1, 1]
+            tensordict.set(("info", "policy_action"), action)
+            target_rate, target_thrust = action.split([3, 1], -1)
+            
+            # raw action error
+            ctbr_action = torch.concat([target_rate, target_thrust], dim=-1)
+            prev_ctbr_action = tensordict[("info", "prev_action")]
+
+            action_error = torch.norm(ctbr_action - prev_ctbr_action, dim = -1)
+            tensordict.set(("stats", "action_error_order1"), action_error)
+            # update prev_action = current ctbr_action
+            tensordict.set(("info", "prev_action"), ctbr_action)
+            # update prev_prev_action =  prev_ctbr_action
+            tensordict.set(("info", "prev_prev_action"), prev_ctbr_action)
+            
+            # scale
+            # target_rate: [-pi, pi]
+            # target_thrust: [0, 15.0]
+            target_rate = target_rate * torch.pi
+            target_thrust = (target_thrust + 1) / 2 * 20.0
+            
+            cmds = self.controller(
+                drone_state, 
+                target_rate=target_rate,
+                target_thrust=target_thrust,
+                reset_pid=tensordict['done'].expand(-1, drone_state.shape[1]) # num_drones: drone_state.shape[1]
+            )
+            # cmds[:] = -0.7035, # 9.81¶ÔÓ¦µÄreal output, v2
+            # cmds[:] = -0.88102558 # hover, kf = 2.129947710581981e-05
+            torch.nan_to_num_(cmds, 0.)
+            tensordict.set(key, cmds)
+            tensordict.set('target_rate', target_rate)
         return tensordict
 
 

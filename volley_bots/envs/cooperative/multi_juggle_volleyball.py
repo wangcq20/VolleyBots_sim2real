@@ -27,8 +27,9 @@ from volley_bots.envs.volleyball.common import (
     rectangular_cuboid_edges,
 )
 from volley_bots.robots.drone import MultirotorBase
-from volley_bots.utils.torch import euler_to_quaternion, normalize
+from volley_bots.utils.torch import euler_to_quaternion, normalize, quaternion_to_euler
 from volley_bots.views import RigidPrimView
+
 
 _COLOR_T = Tuple[float, float, float, float]
 
@@ -232,6 +233,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.anchor_radius = cfg.task.anchor_radius
         self.racket_radius = 0.2
         self.reward_shaping = cfg.task.reward_shaping
+        self.num_drones = 2
 
         super().__init__(cfg, headless)
 
@@ -293,6 +295,15 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.id = torch.zeros((cfg.task.env.num_envs, 2, 2), device=self.device)
         self.id[:, 0, 0] = 1
         self.id[:, 1, 1] = 1
+        
+        self.last_linear_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
+        self.last_angular_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
+        self.last_linear_a = torch.zeros(self.num_envs, self.num_drones, device=self.device)
+        self.last_angular_a = torch.zeros(self.num_envs, self.num_drones, device=self.device)
+        self.last_linear_jerk = torch.zeros(self.num_envs, self.num_drones, device=self.device)
+        self.last_angular_jerk = torch.zeros(self.num_envs, self.num_drones, device=self.device)
+        self.prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
+        self.reward_action_smoothness_weight: float = cfg.task.reward_action_smoothness_weight
 
     def _design_scene(self):
         drone_model = MultirotorBase.REGISTRY[self.cfg.task.drone_model]
@@ -352,10 +363,13 @@ class MultiJuggleVolleyball(IsaacEnv):
         observation_dim = (
             drone_state_dim + 3 + 3 + 3 + 3 + 2 + 2
         )  # specified in function _compute_state_and_obs
-
+        
+        self.time_encoding_dim = 4
         if self.cfg.task.time_encoding:
             self.time_encoding_dim = 4
             observation_dim += self.time_encoding_dim
+        
+        state_dim = observation_dim + self.time_encoding_dim
 
         self.observation_spec = (
             CompositeSpec(
@@ -364,6 +378,9 @@ class MultiJuggleVolleyball(IsaacEnv):
                         {
                             "observation": UnboundedContinuousTensorSpec(
                                 (2, observation_dim)  # 2 drones
+                            ),
+                            "state": UnboundedContinuousTensorSpec(
+                                (state_dim)
                             ),
                         }
                     )
@@ -411,6 +428,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             "drone",
             2,
             observation_key=("agents", "observation"),
+            state_key=("agents", "state"),
             action_key=("agents", "action"),
             reward_key=("agents", "reward"),
         )
@@ -459,6 +477,25 @@ class MultiJuggleVolleyball(IsaacEnv):
                 "reward_success_hit": UnboundedContinuousTensorSpec(1),
                 "reward_success_cross": UnboundedContinuousTensorSpec(1),
                 "penalty_dist_to_anchor": UnboundedContinuousTensorSpec(1),
+
+                "action_error_order1_mean": UnboundedContinuousTensorSpec(1),
+                "action_error_order1_max": UnboundedContinuousTensorSpec(1),
+                "smoothness_mean": UnboundedContinuousTensorSpec(1),
+                "smoothness_max": UnboundedContinuousTensorSpec(1),
+                "linear_v_max": UnboundedContinuousTensorSpec(1),
+                "angular_v_max": UnboundedContinuousTensorSpec(1),
+                "linear_a_max": UnboundedContinuousTensorSpec(1),
+                "angular_a_max": UnboundedContinuousTensorSpec(1),
+                "linear_jerk_max": UnboundedContinuousTensorSpec(1),
+                "angular_jerk_max": UnboundedContinuousTensorSpec(1),
+                "linear_v_mean": UnboundedContinuousTensorSpec(1),
+                "angular_v_mean": UnboundedContinuousTensorSpec(1),
+                "linear_a_mean": UnboundedContinuousTensorSpec(1),
+                "angular_a_mean": UnboundedContinuousTensorSpec(1),
+                "linear_jerk_mean": UnboundedContinuousTensorSpec(1),
+                "angular_jerk_mean": UnboundedContinuousTensorSpec(1),
+                "reward_action_smoothness": UnboundedContinuousTensorSpec(1),
+
                 "num_sim_hits": UnboundedContinuousTensorSpec(1),
                 "drone0_num_sim_hits": UnboundedContinuousTensorSpec(1),
                 "drone1_num_sim_hits": UnboundedContinuousTensorSpec(1),
@@ -511,6 +548,8 @@ class MultiJuggleVolleyball(IsaacEnv):
             CompositeSpec(
                 {
                     "drone_state": UnboundedContinuousTensorSpec((self.drone.n, 13)),
+                    "prev_action": torch.stack([self.drone.action_spec] * self.drone.n, 0).to(self.device),
+                    "policy_action": torch.stack([self.drone.action_spec] * self.drone.n, 0).to(self.device),
                 }
             )
             .expand(self.num_envs)
@@ -680,6 +719,18 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.last_cross_step[env_ids] = -100.0
         self.stats[env_ids] = 0.0
 
+        self.last_linear_v[env_ids] = torch.zeros_like(self.last_linear_v[env_ids])
+        self.last_angular_v[env_ids] = torch.zeros_like(self.last_angular_v[env_ids])
+        self.last_linear_a[env_ids] = torch.zeros_like(self.last_linear_a[env_ids])
+        self.last_angular_a[env_ids] = torch.zeros_like(self.last_angular_a[env_ids])
+        self.last_linear_jerk[env_ids] = torch.zeros_like(self.last_linear_jerk[env_ids])
+        self.last_angular_jerk[env_ids] = torch.zeros_like(self.last_angular_jerk[env_ids])
+
+        # CTBR
+        cmd_init = 2.0 * (self.drone.throttle[env_ids]) ** 2 - 1.0
+        self.info['prev_action'][env_ids, :, 3] = cmd_init.mean(dim=-1)
+        self.prev_actions[env_ids] = self.info['prev_action'][env_ids].clone()
+
         # draw
         if (env_ids == self.central_env_idx).any() and self._should_render(0):
             self.ball_traj_vis.clear()
@@ -702,8 +753,17 @@ class MultiJuggleVolleyball(IsaacEnv):
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")].clone()
-        if self.cfg.task.get("tanh_action", False):
-            actions = torch.tanh(actions)
+        # CTBR
+        self.info["prev_action"] = tensordict[("info", "prev_action")]
+        self.prev_actions = self.info["prev_action"].clone()
+
+        self.info["policy_action"] = tensordict[("info", "policy_action")]
+        self.policy_actions = tensordict[("info", "policy_action")].clone()
+
+        self.action_error_order1 = tensordict[("stats", "action_error_order1")].clone()
+        self.stats["action_error_order1_mean"].add_(self.action_error_order1.mean(dim=-1).unsqueeze(-1))
+        self.stats["action_error_order1_max"].set_(torch.max(self.stats["action_error_order1_max"], self.action_error_order1.mean(dim=-1).unsqueeze(-1)))
+
         self.effort = self.drone.apply_action(actions)
 
     def _post_sim_step(self, tensordict: TensorDictBase):
@@ -726,6 +786,20 @@ class MultiJuggleVolleyball(IsaacEnv):
         rot = torch.where((rot[..., 0] < 0).unsqueeze(-1), -rot, rot)
         self.drone_rot = rot
 
+        rpy = quaternion_to_euler(rot)
+        
+        self.drone_pos = pos.squeeze(1)
+        self.drone_rpy = rpy.squeeze(1)
+        self.drone_vel = vel.squeeze(1)
+        self.drone_angular_vel = angular_vel.squeeze(1)
+        self.roll = rpy[..., 0]
+        self.pitch = rpy[..., 1]
+        self.yaw = rpy[..., 2]
+        
+        self.info["roll"] = self.roll
+        self.info["pitch"] = self.pitch
+        self.info["yaw"] = self.yaw
+        
         self.rpos_drone = torch.stack(
             [
                 # [..., drone_id, [x, y, z]]
@@ -754,6 +828,39 @@ class MultiJuggleVolleyball(IsaacEnv):
             obs.append(t.expand(-1, 2, self.time_encoding_dim))
 
         obs = torch.cat(obs, dim=-1)
+        t = (self.progress_buf / self.max_episode_length).unsqueeze(-1)
+        state = torch.concat([obs.mean(dim=1, keepdim=True), t.expand(-1, self.time_encoding_dim).unsqueeze(1)], dim=-1).squeeze(1)
+
+        self.stats["smoothness_mean"].add_(self.drone.throttle_difference.mean(dim=-1, keepdim=True))
+        self.stats["smoothness_max"].set_(torch.max(self.drone.throttle_difference.max(dim=-1, keepdim=True)[0], self.stats["smoothness_max"]))
+        # linear_v, angular_v
+        self.linear_v = torch.norm(self.root_state[..., 7:10], dim=-1)
+        self.angular_v = torch.norm(self.root_state[..., 10:13], dim=-1)
+        self.stats["linear_v_max"].set_(torch.max(self.stats["linear_v_max"], torch.abs(self.linear_v).max(dim=-1, keepdim=True)[0]))
+        self.stats["linear_v_mean"].add_(self.linear_v.mean(dim=-1, keepdim=True))
+        self.stats["angular_v_max"].set_(torch.max(self.stats["angular_v_max"], torch.abs(self.angular_v).max(dim=-1, keepdim=True)[0]))
+        self.stats["angular_v_mean"].add_(self.angular_v.mean(dim=-1, keepdim=True))
+        # linear_a, angular_a
+        self.linear_a = torch.abs(self.linear_v - self.last_linear_v) / self.dt
+        self.angular_a = torch.abs(self.angular_v - self.last_angular_v) / self.dt
+        self.stats["linear_a_max"].set_(torch.max(self.stats["linear_a_max"], torch.abs(self.linear_a).max(dim=-1, keepdim=True)[0]))
+        self.stats["linear_a_mean"].add_(self.linear_a.mean(dim=-1, keepdim=True))
+        self.stats["angular_a_max"].set_(torch.max(self.stats["angular_a_max"], torch.abs(self.angular_a).max(dim=-1, keepdim=True)[0]))
+        self.stats["angular_a_mean"].add_(self.angular_a.mean(dim=-1, keepdim=True))
+        # linear_jerk, angular_jerk
+        self.linear_jerk = torch.abs(self.linear_a - self.last_linear_a) / self.dt
+        self.angular_jerk = torch.abs(self.angular_a - self.last_angular_a) / self.dt
+        self.stats["linear_jerk_max"].set_(torch.max(self.stats["linear_jerk_max"], torch.abs(self.linear_jerk).max(dim=-1, keepdim=True)[0]))
+        self.stats["linear_jerk_mean"].add_(self.linear_jerk.mean(dim=-1, keepdim=True))
+        self.stats["angular_jerk_max"].set_(torch.max(self.stats["angular_jerk_max"], torch.abs(self.angular_jerk).max(dim=-1, keepdim=True)[0]))
+        self.stats["angular_jerk_mean"].add_(self.angular_jerk.mean(dim=-1, keepdim=True))
+
+        self.last_linear_v = self.linear_v.clone()
+        self.last_angular_v = self.angular_v.clone()
+        self.last_linear_a = self.linear_a.clone()
+        self.last_angular_a = self.angular_a.clone()
+        self.last_linear_jerk = self.linear_jerk.clone()
+        self.last_angular_jerk = self.angular_jerk.clone()
 
         if self._should_render(0):
             central_env_pos = self.envs_positions[self.central_env_idx]
@@ -772,6 +879,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             {
                 "agents": {
                     "observation": obs,
+                    "state":state, 
                 },
                 "stats": self.stats,
                 "info": self.info,
@@ -909,7 +1017,10 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         shaping_reward = reward_dist_to_ball + reward_hit_direction
 
-        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward
+        not_begin_flag = (self.progress_buf > 1).unsqueeze(1)
+        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.action_error_order1) * not_begin_flag.float()
+
+        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness
 
         # done
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(
@@ -997,6 +1108,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.stats["reward_success_hit"].add_(reward_success_hit)
         self.stats["reward_success_cross"].add_(reward_success_cross)
         self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor)
+        self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True))
 
         if self.reward_shaping:
             self.stats["shaping_reward"].add_(shaping_reward.mean(dim=-1, keepdim=True))
@@ -1123,6 +1235,31 @@ class MultiJuggleVolleyball(IsaacEnv):
                 dist_to_anchor[:, 0].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
+            )
+            ep_len = self.progress_buf.unsqueeze(-1)
+            self.stats['action_error_order1_mean'].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats['smoothness_mean'].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats["linear_v_mean"].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats["angular_v_mean"].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats["linear_a_mean"].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats["angular_a_mean"].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats["linear_jerk_mean"].div_(
+                torch.where(done, ep_len, torch.ones_like(ep_len))
+            )
+            self.stats["angular_jerk_mean"].div_( 
+                torch.where(done, ep_len, torch.ones_like(ep_len))
             )
 
         return TensorDict(
