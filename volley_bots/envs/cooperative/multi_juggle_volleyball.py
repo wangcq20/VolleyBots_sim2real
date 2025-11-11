@@ -279,8 +279,8 @@ class MultiJuggleVolleyball(IsaacEnv):
             + self.anchor,
         )
         self.init_drone_rpy_dist = D.Uniform(
-            torch.tensor([-0.1, -0.1, 0.0], device=self.device) * torch.pi,
-            torch.tensor([0.1, 0.1, 2.0], device=self.device) * torch.pi,
+            torch.tensor([-0.1, -0.1, 0.3], device=self.device) * torch.pi,
+            torch.tensor([0.1, 0.1, -0.3], device=self.device) * torch.pi,
         )
         self.init_ball_offset = torch.tensor(cfg.task.ball_offset, device=self.device)
 
@@ -352,9 +352,12 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         material = UsdShade.Material(material.prim)
         for drone_prim in drone_prims:
-            collision_prim = drone_prim.GetPrimAtPath("base_link/collisions")
+            collision_prim = drone_prim.GetPrimAtPath("bat/collisions")
             binding_api = UsdShade.MaterialBindingAPI(collision_prim)
             binding_api.Bind(material, UsdShade.Tokens.weakerThanDescendants, "physics")
+
+            cr_api_drone = PhysxSchema.PhysxContactReportAPI.Apply(collision_prim)
+            cr_api_drone.CreateThresholdAttr().Set(0.0)
 
         return ["/World/defaultGroundPlane"]
 
@@ -477,6 +480,7 @@ class MultiJuggleVolleyball(IsaacEnv):
                 "reward_success_hit": UnboundedContinuousTensorSpec(1),
                 "reward_success_cross": UnboundedContinuousTensorSpec(1),
                 "penalty_dist_to_anchor": UnboundedContinuousTensorSpec(1),
+                "penalty_yaw": UnboundedContinuousTensorSpec(1),
 
                 "action_error_order1_mean": UnboundedContinuousTensorSpec(1),
                 "action_error_order1_max": UnboundedContinuousTensorSpec(1),
@@ -933,7 +937,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         wrong_hit = wrong_hit_turn | wrong_hit_racket # “错误击球”= 错误回合 或 错误球拍
         success_hit = true_hit & torch.logical_not(wrong_hit) # “成功击球”= 真实击球 并且 不是错误击球
 
-        self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
+        # self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
+        self.turn = (self.turn + true_hit.any(dim=-1, keepdim=True)) % 2 # 如果有击球，则切换回合（0变1，1变0）
 
         # ball cross middle # 检查球是否过网
         true_cross_step_gap = 3 # 定义两次“真实过网”之间的最小时间步间隔
@@ -1024,7 +1029,10 @@ class MultiJuggleVolleyball(IsaacEnv):
         not_begin_flag = (self.progress_buf > 1).unsqueeze(1) # 标记是否非初始步骤（>1），避免在第一步计算
         reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.action_error_order1) * not_begin_flag.float() # 动作平滑度奖励
 
-        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness # 总奖励
+        _penalty_yaw_coeff = 0.03
+        penalty_yaw = _penalty_yaw_coeff * self.yaw.abs()
+
+        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness - penalty_yaw # 总奖励
 
         # done # 计算回合是否结束
         truncated = (self.progress_buf >= self.max_episode_length).unsqueeze( # 检查是否达到最大回合长度（截断）
@@ -1113,6 +1121,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.stats["reward_success_cross"].add_(reward_success_cross) # 累加成功过网奖励
         self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor) # 累加锚点距离惩罚
         self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True)) # 累加动作平滑度奖励
+        self.stats["penalty_yaw"].add_(penalty_yaw.mean(dim=-1, keepdim=True)) # 累加动作平滑度奖励
+
 
         if self.reward_shaping: # 如果启用了奖励塑形
             self.stats["shaping_reward"].add_(shaping_reward.mean(dim=-1, keepdim=True)) # 累加平均塑形奖励
