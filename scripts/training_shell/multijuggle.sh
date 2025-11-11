@@ -10,6 +10,7 @@ CUDA_VISIBLE_DEVICES=0 python ../train.py headless=true \
     task.env.num_envs=4096 \
     task.ball_mass=0.005 \
     task.ball_radius=0.1 \
+    task.reward_action_smoothness_weight=0.02 \
     eval_interval=500 \
     save_interval=500 \
     algo=${algorithm} \

@@ -571,7 +571,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             -1
         )  # (E, 2, 3)
 
-        cylinder_bottom_center = self.drone.pos  # (E, 2, 3) cylinder bottom center
+        cylinder_bottom_center = self.drone.pos + normal_vector_world * 0.055  # (E, 2, 3) cylinder bottom center
         cylinder_axis = 2.0 * self.ball_radius * normal_vector_world
 
         ball_to_bottom = self.ball_pos - cylinder_bottom_center  # (E, 2, 3)
@@ -888,386 +888,393 @@ class MultiJuggleVolleyball(IsaacEnv):
         )
 
     def _compute_reward_and_done(self):
-        # ball misbehave
-        ball_too_low = self.ball_pos[..., 2] < 2 * self.ball_radius  # (E, 1)
-        ball_too_high = self.ball_pos[..., 2] > 16  # (E, 1)
-        ball_hit_net = self.check_hit_net(self.ball_pos, self.ball_radius)  # (E, 1)
-        ball_out_of_court = self.check_out_of_court(self.ball_pos)  # (E, 1)
-        ball_misbehave = (
+        # ball misbehave # 检查球的违规行为
+        ball_too_low = self.ball_pos[..., 2] < 2 * self.ball_radius  # (E, 1) # 检查球是否过低（低于两倍球半径）
+        ball_too_high = self.ball_pos[..., 2] > 16  # (E, 1) # 检查球是否过高（高于16米）
+        ball_hit_net = self.check_hit_net(self.ball_pos, self.ball_radius)  # (E, 1) # 检查球是否撞网
+        ball_out_of_court = self.check_out_of_court(self.ball_pos)  # (E, 1) # 检查球是否出界
+        ball_misbehave = ( # 球的违规行为（过低、过高、撞网、出界中任意一项）
             ball_too_low | ball_too_high | ball_hit_net | ball_out_of_court
         )  # (E, 1)
 
-        # drone misbehave
-        drone_too_low = self.drone.pos[..., 2] < 2 * self.racket_radius  # (E, 2)
-        drone_hit_net = self.check_hit_net(self.drone.pos, self.racket_radius)  # (E, 2)
-        drone_misbehave = drone_too_low | drone_hit_net  # (E, 2)
+        # drone misbehave # 检查无人机的违规行为
+        drone_too_low = self.drone.pos[..., 2] < 2 * self.racket_radius  # (E, 2) # 检查无人机是否过低（低于两倍球拍半径）
+        drone_hit_net = self.check_hit_net(self.drone.pos, self.racket_radius)  # (E, 2) # 检查无人机是否撞网
+        drone_misbehave = drone_too_low | drone_hit_net  # (E, 2) # 无人机的违规行为（过低或撞网）
 
-        # drone hit ball
-        ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3)
-        hit_drone: torch.Tensor = self.rpos_ball.norm(p=2, dim=-1).argmin(
+        # drone hit ball # 检查无人机击球
+        ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3) # 获取球的接触力（世界坐标系）
+        hit_drone: torch.Tensor = self.rpos_ball.norm(p=2, dim=-1).argmin( # (E, 1) # 计算哪个无人机离球更近（argmin返回索引0或1）
             dim=1, keepdim=True
-        )  # (E, 1) which drone is closer to the ball
-        sim_hit = torch.zeros(
+        )  
+        sim_hit = torch.zeros( # (E, 2) # 初始化一个布尔张量，用于标记模拟中发生的碰撞
             self.num_envs, 2, device=self.device, dtype=torch.bool
-        )  # (E, 2)
-        sim_hit[turn_to_mask(hit_drone)] = ball_contact_forces.any(-1).squeeze(-1)
+        )  
+        sim_hit[turn_to_mask(hit_drone)] = ball_contact_forces.any(-1).squeeze(-1) # 如果球受到了接触力，标记离球最近的那个无人机为“模拟击球”
 
-        true_hit_step_gap = 3
-        true_hit = sim_hit & (
+        # 判断击球是否为有效（非连续）
+        true_hit_step_gap = 3 # 定义两次“真实击球”之间的最小时间步间隔
+        true_hit = sim_hit & ( # “真实击球”= 模拟击球 并且 距离上次击球时间 > 间隔
             (self.progress_buf.unsqueeze(-1) - self.last_hit_step) > true_hit_step_gap
         )
-        wrong_hit_sim = sim_hit & (
+        wrong_hit_sim = sim_hit & ( # “错误模拟击球”= 模拟击球 但是 距离上次击球时间 <= 间隔（即连续碰撞）
             (self.progress_buf.unsqueeze(-1) - self.last_hit_step) <= true_hit_step_gap
         )
-        self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)]
+        self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
 
-        wrong_hit_turn: torch.Tensor = true_hit & (
+        # 检查是否由正确回合的无人机击球
+        wrong_hit_turn: torch.Tensor = true_hit & ( # “错误回合击球”= 真实击球 并且 击球的无人机不是当前回合的无人机
             self.turn != hit_drone
         )
-        ball_near_racket = self.check_ball_near_racket()
-        wrong_hit_racket = true_hit & torch.logical_not(ball_near_racket)
-        wrong_hit = wrong_hit_turn | wrong_hit_racket
-        success_hit = true_hit & torch.logical_not(wrong_hit)
+    
+        # 检测是否拍打到球 # 检查球是否在球拍范围内
+        ball_near_racket = self.check_ball_near_racket() # (E, 2) # 检查球是否在无人机的球拍（圆柱体）范围内
+        wrong_hit_racket = true_hit & torch.logical_not(ball_near_racket) # “错误球拍击球”= 真实击球 并且 球不在球拍范围内
+        wrong_hit = wrong_hit_turn | wrong_hit_racket # “错误击球”= 错误回合 或 错误球拍
+        success_hit = true_hit & torch.logical_not(wrong_hit) # “成功击球”= 真实击球 并且 不是错误击球
 
-        self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2
+        self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
 
-        # ball cross middle
-        true_cross_step_gap = 3
-        ball_cross = self.ball_pos[..., 1].abs() <= self.ball_radius  # (E, 1)
-        true_cross = ball_cross & (
+        # ball cross middle # 检查球是否过网
+        true_cross_step_gap = 3 # 定义两次“真实过网”之间的最小时间步间隔
+        ball_cross = self.ball_pos[..., 1].abs() <= self.ball_radius  # (E, 1) # 检查球是否在球网（y=0）附近（一个球半径内）
+        true_cross = ball_cross & ( # “真实过网”= 球在球网附近 并且 距离上次过网时间 > 间隔
             self.progress_buf.unsqueeze(-1) - self.last_cross_step > true_cross_step_gap
         )  # (E, 1)
-        above_min_height = self.ball_pos[..., 2] > self.min_height  # (E, 1)
-        success_cross = true_cross & above_min_height  # (E, 1)
-        self.last_cross_step[ball_cross] = self.progress_buf[ball_cross.squeeze(-1)]
+        above_min_height = self.ball_pos[..., 2] > self.min_height  # (E, 1) # 检查球的高度是否高于要求的最小高度
+        success_cross = true_cross & above_min_height  # (E, 1) # “成功过网”= 真实过网 并且 高于最小高度
+        self.last_cross_step[ball_cross] = self.progress_buf[ball_cross.squeeze(-1)] # 更新发生了球过网的环境的“最后过网时间”
 
-        if self._should_render(0):
-            self.debug_draw_hit_racket(
+        if self._should_render(0): # 如果需要渲染（通常是中心环境）
+            self.debug_draw_hit_racket( # 绘制击球和球拍检测的可视化标记
                 true_hit[self.central_env_idx], ball_near_racket[self.central_env_idx]
             )
-            self.debug_draw_min_height(ball_cross[self.central_env_idx, 0])
-            if success_hit[self.central_env_idx].any():
-                self.debug_draw_turn()
+            self.debug_draw_min_height(ball_cross[self.central_env_idx, 0]) # 绘制最小过网高度的可视化标记
+            if success_hit[self.central_env_idx].any(): # 如果中心环境发生了成功击球
+                self.debug_draw_turn() # 绘制当前回合的可视化标记
 
-        # misbehave penalty
-        _misbehave_penalty_coeff = 10.0
-        penalty_ball_misbehave = (
+        # misbehave penalty # 计算违规行为惩罚
+        _misbehave_penalty_coeff = 10.0 # 违规行为惩罚系数
+        penalty_ball_misbehave = ( # 球违规的惩罚（共享，稀疏）
             _misbehave_penalty_coeff * ball_misbehave
         )  # share, sparse, (E, 1)
-        penalty_drone_misbehave = (
+        penalty_drone_misbehave = ( # 无人机违规的惩罚（独立，稀疏）
             _misbehave_penalty_coeff * drone_misbehave
         )  # individual, sparse, (E, 2)
-        penalty_wrong_hit = (
+        penalty_wrong_hit = ( # 错误击球的惩罚（独立，稀疏）
             _misbehave_penalty_coeff * wrong_hit
         )  # individual, sparse, (E, 2)
 
-        misbehave_penalty = (
+        misbehave_penalty = ( # 总的违规惩罚（(E, 2)，通过广播相加）
             penalty_ball_misbehave + penalty_drone_misbehave + penalty_wrong_hit
         )  # (E, 2)
 
-        # task reward
-        _task_reward_coeff = 1.0  # 1.0,10.0
-        reward_success_hit = _task_reward_coeff * success_hit.any(
+        # task reward # 计算任务奖励
+        _task_reward_coeff = 1.0  # 1.0,10.0 # 任务奖励系数
+        reward_success_hit = _task_reward_coeff * success_hit.any( # 成功击球的奖励（共享，稀疏）
             -1, keepdim=True
         )  # share, sparse, (E, 1)
-        reward_success_cross = (
+        reward_success_cross = ( # 成功过网的奖励（共享，稀疏）
             _task_reward_coeff * success_cross
         )  # share, sparse, (E, 1)
 
-        _dist_coeff = 0.05  # 0.05,0.03
-        dist_to_anchor = torch.norm(self.drone.pos - self.anchor, p=2, dim=-1)  # (E, 2)
-        penalty_dist_to_anchor = _dist_coeff * (
+        _dist_coeff = 0.05  # 0.05,0.03 # 距离惩罚系数
+        dist_to_anchor = torch.norm(self.drone.pos - self.anchor, p=2, dim=-1)  # (E, 2) # 计算无人机到其锚点（anchor）的距离
+        penalty_dist_to_anchor = _dist_coeff * ( # 距离锚点过远（超过半径）的惩罚
             dist_to_anchor - self.anchor_radius
         ).clamp(
             min=0
         )  # individual, sparse, (E, 2)
-        penalty_dist_to_anchor = penalty_dist_to_anchor.mean(
+        penalty_dist_to_anchor = penalty_dist_to_anchor.mean( # 将两个无人机的惩罚平均（共享，稀疏）
             -1, keepdim=True
         )  # share, sparse, (E, 1)
 
-        task_reward = reward_success_hit + reward_success_cross - penalty_dist_to_anchor
+        task_reward = reward_success_hit + reward_success_cross - penalty_dist_to_anchor # 总的任务奖励
 
-        # shaping reward
-        dist_to_ball_xy = torch.norm(
+        # shaping reward # 计算塑形奖励
+        dist_to_ball_xy = torch.norm( # 计算无人机到球的XY平面距离
             self.drone.pos[..., :2] - self.ball_pos[..., :2], p=2, dim=-1
         )  # (E, 2)
-        reward_dist_to_ball = (
-            _dist_coeff * (2 * turn_to_mask(self.turn) - 1) / (1 + dist_to_ball_xy)
+        reward_dist_to_ball = ( # 靠近球的奖励（塑形）
+            _dist_coeff * (2 * turn_to_mask(self.turn) - 1) / (1 + dist_to_ball_xy) # (2*mask-1)使得当前回合无人机为正奖励，另一无人机为负奖励
         )  # individual, dense, (E, 2)
-        reward_dist_to_ball = reward_dist_to_ball.mean(
+        reward_dist_to_ball = reward_dist_to_ball.mean( # 将两个无人机的奖励平均（共享，稠密）
             -1, keepdim=True
         )  # share, dense, (E, 1)
 
-        _direction_reward_coeff = 1.0
-        target_dir_xy = (
+        _direction_reward_coeff = 1.0 # 击球方向奖励系数
+        target_dir_xy = ( # 目标方向（从当前回合无人机指向对方无人机）的XY向量
             self.drone.pos[turn_to_mask(self.turn)]
             - self.drone.pos[turn_to_mask(~self.turn)]
         )[
             ..., :2
         ]  # (E, 2)
-        ball_dir_xy = self.ball_vel[:, 0, :2]  # (E, 2)
-        cosine_similarity = NNF.cosine_similarity(
+        ball_dir_xy = self.ball_vel[:, 0, :2]  # (E, 2) # 球的速度向量（XY平面）
+        cosine_similarity = NNF.cosine_similarity( # 计算目标方向和球速度方向的余弦相似度
             target_dir_xy, ball_dir_xy, dim=-1
         ).unsqueeze(
             -1
         )  # (E, 1)
-        reward_hit_direction = (
+        reward_hit_direction = ( # 击球方向奖励 = 系数 * 成功击球 * 相似度
             _direction_reward_coeff * success_hit * cosine_similarity
         )  # individual, sparse, (E, 2)
 
-        shaping_reward = reward_dist_to_ball + reward_hit_direction
+        shaping_reward = reward_dist_to_ball + reward_hit_direction # 总的塑形奖励
 
-        not_begin_flag = (self.progress_buf > 1).unsqueeze(1)
-        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.action_error_order1) * not_begin_flag.float()
+        not_begin_flag = (self.progress_buf > 1).unsqueeze(1) # 标记是否非初始步骤（>1），避免在第一步计算
+        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.action_error_order1) * not_begin_flag.float() # 动作平滑度奖励
 
-        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness
+        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness # 总奖励
 
-        # done
-        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(
+        # done # 计算回合是否结束
+        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze( # 检查是否达到最大回合长度（截断）
             -1
         )  # (E, 1)
-        terminated = (
+        terminated = ( # 检查是否触发终止条件（球违规、无人机违规、错误击球）
             ball_misbehave
             | drone_misbehave.any(-1, keepdim=True)
             | wrong_hit.any(-1, keepdim=True)
         )  # (E, 1)
-        done: torch.Tensor = truncated | terminated  # (E, 1)
+        done: torch.Tensor = truncated | terminated  # (E, 1) # 最终的 done 标记（截断或终止）
 
-        # log stats
-        self.stats["return"].add_(reward.mean(dim=-1, keepdim=True))
-        self.stats["episode_len"] = self.progress_buf.unsqueeze(1)
+        # log stats # 记录统计数据
+        self.stats["return"].add_(reward.mean(dim=-1, keepdim=True)) # 累加平均奖励到回报
+        self.stats["episode_len"] = self.progress_buf.unsqueeze(1) # 记录当前回合长度
 
-        self.stats["done"].add_(done.float())
-        self.stats["truncated"].add_(truncated.float())
-        self.stats["terminated"].add_(terminated.float())
+        self.stats["done"].add_(done.float()) # 累加 done 次数
+        self.stats["truncated"].add_(truncated.float()) # 累加 truncated (截断) 次数
+        self.stats["terminated"].add_(terminated.float()) # 累加 terminated (终止) 次数
 
-        self.stats["ball_misbehave"] = ball_misbehave.float()
-        self.stats["ball_too_low"] = ball_too_low.float()
-        self.stats["ball_too_high"] = ball_too_high.float()
-        self.stats["ball_hit_net"] = ball_hit_net.float()
-        self.stats["ball_out_of_court"] = ball_out_of_court.float()
+        self.stats["ball_misbehave"] = ball_misbehave.float() # 记录球违规
+        self.stats["ball_too_low"] = ball_too_low.float() # 记录球过低
+        self.stats["ball_too_high"] = ball_too_high.float() # 记录球过高
+        self.stats["ball_hit_net"] = ball_hit_net.float() # 记录球撞网
+        self.stats["ball_out_of_court"] = ball_out_of_court.float() # 记录球出界
 
-        self.stats["drone_misbehave"] = drone_misbehave.any(-1, keepdim=True).float()
-        self.stats["drone0_misbehave"] = drone_misbehave[..., 0].unsqueeze(-1).float()
-        self.stats["drone1_misbehave"] = drone_misbehave[..., 1].unsqueeze(-1).float()
-        self.stats["drone_too_low"] = drone_too_low.any(-1, keepdim=True).float()
-        self.stats["drone0_too_low"] = drone_too_low[..., 0].unsqueeze(-1).float()
-        self.stats["drone1_too_low"] = drone_too_low[..., 1].unsqueeze(-1).float()
-        self.stats["drone_hit_net"] = drone_hit_net.any(-1, keepdim=True).float()
-        self.stats["drone0_hit_net"] = drone_hit_net[..., 0].unsqueeze(-1).float()
-        self.stats["drone1_hit_net"] = drone_hit_net[..., 1].unsqueeze(-1).float()
+        self.stats["drone_misbehave"] = drone_misbehave.any(-1, keepdim=True).float() # 记录无人机违规（任意一个）
+        self.stats["drone0_misbehave"] = drone_misbehave[..., 0].unsqueeze(-1).float() # 记录无人机0违规
+        self.stats["drone1_misbehave"] = drone_misbehave[..., 1].unsqueeze(-1).float() # 记录无人机1违规
+        self.stats["drone_too_low"] = drone_too_low.any(-1, keepdim=True).float() # 记录无人机过低（任意一个）
+        self.stats["drone0_too_low"] = drone_too_low[..., 0].unsqueeze(-1).float() # 记录无人机0过低
+        self.stats["drone1_too_low"] = drone_too_low[..., 1].unsqueeze(-1).float() # 记录无人机1过低
+        self.stats["drone_hit_net"] = drone_hit_net.any(-1, keepdim=True).float() # 记录无人机撞网（任意一个）
+        self.stats["drone0_hit_net"] = drone_hit_net[..., 0].unsqueeze(-1).float() # 记录无人机0撞网
+        self.stats["drone1_hit_net"] = drone_hit_net[..., 1].unsqueeze(-1).float() # 记录无人机1撞网
 
-        self.stats["wrong_hit"] = wrong_hit.any(-1, keepdim=True).float()
-        self.stats["drone0_wrong_hit"] = wrong_hit[..., 0].unsqueeze(-1).float()
-        self.stats["drone1_wrong_hit"] = wrong_hit[..., 1].unsqueeze(-1).float()
-        self.stats["wrong_hit_turn"] = wrong_hit_turn.any(-1, keepdim=True).float()
-        self.stats["drone0_wrong_hit_turn"] = (
+        self.stats["wrong_hit"] = wrong_hit.any(-1, keepdim=True).float() # 记录错误击球（任意一个）
+        self.stats["drone0_wrong_hit"] = wrong_hit[..., 0].unsqueeze(-1).float() # 记录无人机0错误击球
+        self.stats["drone1_wrong_hit"] = wrong_hit[..., 1].unsqueeze(-1).float() # 记录无人机1错误击球
+        self.stats["wrong_hit_turn"] = wrong_hit_turn.any(-1, keepdim=True).float() # 记录错误回合击球（任意一个）
+        self.stats["drone0_wrong_hit_turn"] = ( # 记录无人机0错误回合击球
             wrong_hit_turn[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_wrong_hit_turn"] = (
+        self.stats["drone1_wrong_hit_turn"] = ( # 记录无人机1错误回合击球
             wrong_hit_turn[..., 1].unsqueeze(-1).float()
         )
-        self.stats["wrong_hit_racket"] = wrong_hit_racket.any(-1, keepdim=True).float()
-        self.stats["drone0_wrong_hit_racket"] = (
+        self.stats["wrong_hit_racket"] = wrong_hit_racket.any(-1, keepdim=True).float() # 记录错误球拍击球（任意一个）
+        self.stats["drone0_wrong_hit_racket"] = ( # 记录无人机0错误球拍击球
             wrong_hit_racket[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_wrong_hit_racket"] = (
+        self.stats["drone1_wrong_hit_racket"] = ( # 记录无人机1错误球拍击球
             wrong_hit_racket[..., 1].unsqueeze(-1).float()
         )
 
-        self.stats["misbehave_penalty"].add_(
+        self.stats["misbehave_penalty"].add_( # 累加平均违规惩罚
             misbehave_penalty.mean(dim=-1, keepdim=True)
         )
-        self.stats["drone0_misbehave_penalty"].add_(
+        self.stats["drone0_misbehave_penalty"].add_( # 累加无人机0违规惩罚
             misbehave_penalty[..., 0].unsqueeze(-1)
         )
-        self.stats["drone1_misbehave_penalty"].add_(
+        self.stats["drone1_misbehave_penalty"].add_( # 累加无人机1违规惩罚
             misbehave_penalty[..., 1].unsqueeze(-1)
         )
-        self.stats["penalty_ball_misbehave"].add_(penalty_ball_misbehave)
-        self.stats["penalty_drone_misbehave"].add_(
+        self.stats["penalty_ball_misbehave"].add_(penalty_ball_misbehave) # 累加球违规惩罚
+        self.stats["penalty_drone_misbehave"].add_( # 累加平均无人机违规惩罚
             penalty_drone_misbehave.mean(dim=-1, keepdim=True)
         )
-        self.stats["drone0_penalty_drone_misbehave"].add_(
+        self.stats["drone0_penalty_drone_misbehave"].add_( # 累加无人机0违规惩罚
             penalty_drone_misbehave[..., 0].unsqueeze(-1)
         )
-        self.stats["drone1_penalty_drone_misbehave"].add_(
+        self.stats["drone1_penalty_drone_misbehave"].add_( # 累加无人机1违规惩罚
             penalty_drone_misbehave[..., 1].unsqueeze(-1)
         )
-        self.stats["penalty_wrong_hit"].add_(
+        self.stats["penalty_wrong_hit"].add_( # 累加平均错误击球惩罚
             penalty_wrong_hit.mean(dim=-1, keepdim=True)
         )
-        self.stats["drone0_penalty_wrong_hit"].add_(
+        self.stats["drone0_penalty_wrong_hit"].add_( # 累加无人机0错误击球惩罚
             penalty_wrong_hit[..., 0].unsqueeze(-1)
         )
-        self.stats["drone1_penalty_wrong_hit"].add_(
+        self.stats["drone1_penalty_wrong_hit"].add_( # 累加无人机1错误击球惩罚
             penalty_wrong_hit[..., 1].unsqueeze(-1)
         )
 
-        self.stats["task_reward"].add_(task_reward)
-        self.stats["reward_success_hit"].add_(reward_success_hit)
-        self.stats["reward_success_cross"].add_(reward_success_cross)
-        self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor)
-        self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True))
+        self.stats["task_reward"].add_(task_reward) # 累加任务奖励
+        self.stats["reward_success_hit"].add_(reward_success_hit) # 累加成功击球奖励
+        self.stats["reward_success_cross"].add_(reward_success_cross) # 累加成功过网奖励
+        self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor) # 累加锚点距离惩罚
+        self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True)) # 累加动作平滑度奖励
 
-        if self.reward_shaping:
-            self.stats["shaping_reward"].add_(shaping_reward.mean(dim=-1, keepdim=True))
-            self.stats["drone0_shaping_reward"].add_(
+        if self.reward_shaping: # 如果启用了奖励塑形
+            self.stats["shaping_reward"].add_(shaping_reward.mean(dim=-1, keepdim=True)) # 累加平均塑形奖励
+            self.stats["drone0_shaping_reward"].add_( # 累加无人机0塑形奖励
                 shaping_reward[..., 0].unsqueeze(-1)
             )
-            self.stats["drone1_shaping_reward"].add_(
+            self.stats["drone1_shaping_reward"].add_( # 累加无人机1塑形奖励
                 shaping_reward[..., 1].unsqueeze(-1)
             )
-            self.stats["reward_hit_direction"].add_(
+            self.stats["reward_hit_direction"].add_( # 累加平均击球方向奖励
                 reward_hit_direction.mean(dim=-1, keepdim=True)
             )
-            self.stats["drone0_reward_hit_direction"].add_(
+            self.stats["drone0_reward_hit_direction"].add_( # 累加无人机0击球方向奖励
                 reward_hit_direction[..., 0].unsqueeze(-1)
             )
-            self.stats["drone1_reward_hit_direction"].add_(
+            self.stats["drone1_reward_hit_direction"].add_( # 累加无人机1击球方向奖励
                 reward_hit_direction[..., 1].unsqueeze(-1)
             )
-            self.stats["reward_dist_to_ball"].add_(reward_dist_to_ball)
+            self.stats["reward_dist_to_ball"].add_(reward_dist_to_ball) # 累加到球距离奖励
 
-        self.stats["num_sim_hits"].add_(sim_hit.any(-1, keepdim=True).float())
-        self.stats["drone0_num_sim_hits"].add_(sim_hit[..., 0].unsqueeze(-1).float())
-        self.stats["drone1_num_sim_hits"].add_(sim_hit[..., 1].unsqueeze(-1).float())
-        self.stats["num_true_hits"].add_(true_hit.any(-1, keepdim=True).float())
-        self.stats["drone0_num_true_hits"].add_(true_hit[..., 0].unsqueeze(-1).float())
-        self.stats["drone1_num_true_hits"].add_(true_hit[..., 1].unsqueeze(-1).float())
-        self.stats["num_success_hits"].add_(success_hit.any(-1, keepdim=True).float())
-        self.stats["drone0_num_success_hits"].add_(
+        self.stats["num_sim_hits"].add_(sim_hit.any(-1, keepdim=True).float()) # 累加模拟击球次数
+        self.stats["drone0_num_sim_hits"].add_(sim_hit[..., 0].unsqueeze(-1).float()) # 累加无人机0模拟击球次数
+        self.stats["drone1_num_sim_hits"].add_(sim_hit[..., 1].unsqueeze(-1).float()) # 累加无人机1模拟击球次数
+        self.stats["num_true_hits"].add_(true_hit.any(-1, keepdim=True).float()) # 累加真实击球次数
+        self.stats["drone0_num_true_hits"].add_(true_hit[..., 0].unsqueeze(-1).float()) # 累加无人机0真实击球次数
+        self.stats["drone1_num_true_hits"].add_(true_hit[..., 1].unsqueeze(-1).float()) # 累加无人机1真实击球次数
+        self.stats["num_success_hits"].add_(success_hit.any(-1, keepdim=True).float()) # 累加成功击球次数
+        self.stats["drone0_num_success_hits"].add_( # 累加无人机0成功击球次数
             success_hit[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_num_success_hits"].add_(
+        self.stats["drone1_num_success_hits"].add_( # 累加无人机1成功击球次数
             success_hit[..., 1].unsqueeze(-1).float()
         )
-        self.stats["wrong_hit_sim"].add_(wrong_hit_sim.any(-1, keepdim=True).float())
-        self.stats["drone0_wrong_hit_sim"].add_(
+        self.stats["wrong_hit_sim"].add_(wrong_hit_sim.any(-1, keepdim=True).float()) # 累加错误模拟击球次数（连续击球）
+        self.stats["drone0_wrong_hit_sim"].add_( # 累加无人机0错误模拟击球次数
             wrong_hit_sim[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_wrong_hit_sim"].add_(
+        self.stats["drone1_wrong_hit_sim"].add_( # 累加无人机1错误模拟击球次数
             wrong_hit_sim[..., 1].unsqueeze(-1).float()
         )
 
-        self.stats["num_ball_cross"].add_(ball_cross.float())
-        self.stats["num_true_cross"].add_(true_cross.float())
-        self.stats["num_success_cross"].add_(success_cross.float())
-        if success_cross.any():
-            self.update_mean_stats(
+        self.stats["num_ball_cross"].add_(ball_cross.float()) # 累加球过网次数
+        self.stats["num_true_cross"].add_(true_cross.float()) # 累加球真实过网次数
+        self.stats["num_success_cross"].add_(success_cross.float()) # 累加球成功过网次数
+        if success_cross.any(): # 如果有成功过网
+            self.update_mean_stats( # 更新平均过网高度
                 "cross_height",
                 self.ball_pos[..., 2],
                 "num_success_cross",
                 success_cross,
             )
 
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机0的平均x坐标
             "drone0_x", self.drone.pos[:, 0, 0].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机0的平均y坐标
             "drone0_y", self.drone.pos[:, 0, 1].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机0的平均z坐标
             "drone0_z", self.drone.pos[:, 0, 2].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机0到锚点的平均距离
             "drone0_dist_to_anchor", dist_to_anchor[:, 0].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机1的平均x坐标
             "drone1_x", self.drone.pos[:, 1, 0].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机1的平均y坐标
             "drone1_y", self.drone.pos[:, 1, 1].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机1的平均z坐标
             "drone1_z", self.drone.pos[:, 1, 2].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats(
+        self.update_mean_stats( # 更新无人机1到锚点的平均距离
             "drone1_dist_to_anchor", dist_to_anchor[:, 1].unsqueeze(-1), "episode_len"
         )
 
-        if success_hit[..., 0].any():
-            self.update_mean_stats(
+        if success_hit[..., 0].any(): # 如果无人机0成功击球
+            self.update_mean_stats( # 更新无人机0成功击球时的平均x坐标
                 "drone0_hit_x",
                 self.drone.pos[:, 0, 0].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-            self.update_mean_stats(
+            self.update_mean_stats( # 更新无人机0成功击球时的平均y坐标
                 "drone0_hit_y",
                 self.drone.pos[:, 0, 1].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-            self.update_mean_stats(
+            self.update_mean_stats( # 更新无人机0成功击球时的平均z坐标
                 "drone0_hit_z",
                 self.drone.pos[:, 0, 2].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-            self.update_mean_stats(
+            self.update_mean_stats( # 更新无人机0成功击球时到锚点的平均距离
                 "drone0_hit_dist_to_anchor",
                 dist_to_anchor[:, 0].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-        if success_hit[..., 1].any():
-            self.update_mean_stats(
+        if success_hit[..., 1].any(): # 如果无人机1成功击球
+            self.update_mean_stats( # 更新无人机1成功击球时的平均x坐标
                 "drone1_hit_x",
                 self.drone.pos[:, 1, 0].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            self.update_mean_stats(
+            self.update_mean_stats( # 更新无人机1成功击球时的平均y坐标
                 "drone1_hit_y",
                 self.drone.pos[:, 1, 1].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            self.update_mean_stats(
+            self.update_mean_stats( # 更新无人机1成功击球时的平均z坐标
                 "drone1_hit_z",
                 self.drone.pos[:, 1, 2].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            self.update_mean_stats(
+            self.update_mean_stats( # 更新无人机1成功击球时到锚点的平均距离
                 "drone1_hit_dist_to_anchor",
                 dist_to_anchor[:, 0].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            ep_len = self.progress_buf.unsqueeze(-1)
-            self.stats['action_error_order1_mean'].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats['smoothness_mean'].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats["linear_v_mean"].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats["angular_v_mean"].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats["linear_a_mean"].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats["angular_a_mean"].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats["linear_jerk_mean"].div_(
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
-            self.stats["angular_jerk_mean"].div_( 
-                torch.where(done, ep_len, torch.ones_like(ep_len))
-            )
+            
 
-        return TensorDict(
+        # 这里的逻辑是：在回合结束时（done=True），将累加的统计量（如v, a, jerk）转换为平均值
+        ep_len = self.progress_buf.unsqueeze(-1) # 获取当前回合长度
+        self.stats['action_error_order1_mean'].div_( # 计算动作误差的平均值（除以回合长度）
+            torch.where(done, ep_len, torch.ones_like(ep_len)) # 仅在done时除以ep_len，否则除以1
+        )
+        self.stats['smoothness_mean'].div_( # 计算平滑度的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+        self.stats["linear_v_mean"].div_( # 计算线速度的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+        self.stats["angular_v_mean"].div_( # 计算角速度的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+        self.stats["linear_a_mean"].div_( # 计算线加速度的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+        self.stats["angular_a_mean"].div_( # 计算角加速度的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+        self.stats["linear_jerk_mean"].div_( # 计算线加加速度（jerk）的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+        self.stats["angular_jerk_mean"].div_(  # 计算角加加速度（jerk）的平均值
+            torch.where(done, ep_len, torch.ones_like(ep_len))
+        )
+
+        return TensorDict( # 返回包含奖励和done信息的TensorDict
             {
-                "agents": {"reward": reward.unsqueeze(-1)},
-                "done": done,
-                "terminated": terminated,
-                "truncated": truncated,
+                "agents": {"reward": reward.unsqueeze(-1)}, # 奖励（(E, 2, 1)）
+                "done": done, # done 标记 (E, 1)
+                "terminated": terminated, # 终止标记 (E, 1)
+                "truncated": truncated, # 截断标记 (E, 1)
             },
-            self.num_envs,
+            self.num_envs, # 批次大小 (E)
         )

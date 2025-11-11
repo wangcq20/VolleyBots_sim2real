@@ -35,6 +35,6 @@ from volley_bots.robots.drone import MultirotorBase
 
 
 class Air(MultirotorBase):
-    usd_path: str = ASSET_PATH + "/usd/0311_airbat_res1_rad10_col11.usd"
+    usd_path: str = ASSET_PATH + "/usd/air.usd"
     param_path: str = ASSET_PATH + "/usd/air.yaml"
     DEFAULT_CONTROLLER = PID_controller_flightmare
