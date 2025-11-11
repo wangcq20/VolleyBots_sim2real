@@ -924,7 +924,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         wrong_hit_sim = sim_hit & ( # “错误模拟击球”= 模拟击球 但是 距离上次击球时间 <= 间隔（即连续碰撞）
             (self.progress_buf.unsqueeze(-1) - self.last_hit_step) <= true_hit_step_gap
         )
-        self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
+        # self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
+        self.last_hit_step[true_hit] = self.progress_buf[true_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
 
         # 检查是否由正确回合的无人机击球
         wrong_hit_turn: torch.Tensor = true_hit & ( # “错误回合击球”= 真实击球 并且 击球的无人机不是当前回合的无人机
@@ -937,8 +938,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         wrong_hit = wrong_hit_turn | wrong_hit_racket # “错误击球”= 错误回合 或 错误球拍
         success_hit = true_hit & torch.logical_not(wrong_hit) # “成功击球”= 真实击球 并且 不是错误击球
 
-        # self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
-        self.turn = (self.turn + true_hit.any(dim=-1, keepdim=True)) % 2 # 如果有击球，则切换回合（0变1，1变0）
+        self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
 
         # ball cross middle # 检查球是否过网
         true_cross_step_gap = 3 # 定义两次“真实过网”之间的最小时间步间隔
@@ -1009,8 +1009,8 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         _direction_reward_coeff = 1.0 # 击球方向奖励系数
         target_dir_xy = ( # 目标方向（从当前回合无人机指向对方无人机）的XY向量
-            self.drone.pos[turn_to_mask(self.turn)]
-            - self.drone.pos[turn_to_mask(~self.turn)]
+            self.drone.pos[turn_to_mask(~self.turn)]
+            - self.drone.pos[turn_to_mask(self.turn)]
         )[
             ..., :2
         ]  # (E, 2)
