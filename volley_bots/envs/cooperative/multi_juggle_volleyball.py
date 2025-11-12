@@ -367,7 +367,7 @@ class MultiJuggleVolleyball(IsaacEnv):
     def _set_specs(self):
         drone_state_dim = self.drone.state_spec.shape[-1]
         observation_dim = (
-            drone_state_dim + 3 + 3 + 3 + 3 + 2 + 2
+            drone_state_dim + 3 + 3 + 3 + 3 + 3 + 2 + 2
         )  # specified in function _compute_state_and_obs
         
         self.time_encoding_dim = 4
@@ -549,6 +549,9 @@ class MultiJuggleVolleyball(IsaacEnv):
                 "drone1_reward_hit_direction", UnboundedContinuousTensorSpec(1)
             )
             _stats_spec.set("reward_dist_to_ball", UnboundedContinuousTensorSpec(1))
+            _stats_spec.set("reward_drone0_dist_to_ball", UnboundedContinuousTensorSpec(1))
+            _stats_spec.set("reward_drone1_dist_to_ball", UnboundedContinuousTensorSpec(1))
+
         stats_spec = _stats_spec.expand(self.num_envs).to(self.device)
 
         info_spec = (
@@ -827,6 +830,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         obs = [
             self.root_state,  # (E,2,23)
+            self.ball_pos.expand(-1, 2, 3), #(E,2,3)
             rpos_anchor,  # (E,2,3)
             self.rpos_drone[..., :3],  # (E,2,3)
             self.rpos_ball,  # (E,2,3)
@@ -1008,7 +1012,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         )  # (E, 2)
 
         # task reward # 计算任务奖励
-        _task_reward_coeff = 1.0  # 1.0,10.0 # 任务奖励系数
+        _task_reward_coeff = 5.0  # 1.0,10.0 # 任务奖励系数
         reward_success_hit = _task_reward_coeff * success_hit.any( # 成功击球的奖励（共享，稀疏）
             -1, keepdim=True
         )  # share, sparse, (E, 1)
@@ -1036,6 +1040,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         reward_dist_to_ball = ( # 靠近球的奖励（塑形）
             _dist_coeff * (2 * turn_to_mask(self.turn) - 1) / (1 + dist_to_ball_xy) # (2*mask-1)使得当前回合无人机为正奖励，另一无人机为负奖励
         )  # individual, dense, (E, 2)
+        reward_drone_dist_to_ball = reward_dist_to_ball.clone()
         reward_dist_to_ball = reward_dist_to_ball.mean( # 将两个无人机的奖励平均（共享，稠密）
             -1, keepdim=True
         )  # share, dense, (E, 1)
@@ -1175,6 +1180,9 @@ class MultiJuggleVolleyball(IsaacEnv):
                 reward_hit_direction[..., 1].unsqueeze(-1)
             )
             self.stats["reward_dist_to_ball"].add_(reward_dist_to_ball) # 累加到球距离奖励
+            self.stats["reward_drone0_dist_to_ball"].add_(reward_drone_dist_to_ball[..., 0].unsqueeze(-1)) # 累加到球距离奖励
+            self.stats["reward_drone1_dist_to_ball"].add_(reward_drone_dist_to_ball[..., 1].unsqueeze(-1)) # 累加到球距离奖励
+
 
         self.stats["num_sim_hits"].add_(sim_hit.any(-1, keepdim=True).float()) # 累加模拟击球次数
         self.stats["drone0_num_sim_hits"].add_(sim_hit[..., 0].unsqueeze(-1).float()) # 累加无人机0模拟击球次数
