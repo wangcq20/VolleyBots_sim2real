@@ -231,7 +231,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.ball_radius: float = cfg.task.ball_radius
         self.min_height: float = cfg.task.min_height
         self.anchor_radius = cfg.task.anchor_radius
-        self.racket_radius = 0.2
+        self.racket_radius = 0.1
         self.reward_shaping = cfg.task.reward_shaping
         self.num_drones = 2
 
@@ -253,11 +253,11 @@ class MultiJuggleVolleyball(IsaacEnv):
         if randomization and "drone" in randomization:
             self.drone.setup_randomization(self.cfg.task.randomization["drone"])
         # contact sensor
-        contact_sensor_cfg = ContactSensorCfg(prim_path="/World/envs/env_.*/ball")
-        self.contact_sensor: ContactSensor = contact_sensor_cfg.class_type(
-            contact_sensor_cfg
-        )
-        self.contact_sensor._initialize_impl()
+        # contact_sensor_cfg = ContactSensorCfg(prim_path="/World/envs/env_.*/ball")
+        # self.contact_sensor: ContactSensor = contact_sensor_cfg.class_type(
+        #     contact_sensor_cfg
+        # )
+        # self.contact_sensor._initialize_impl()
 
         # ball paras
         self.ball = RigidPrimView(
@@ -296,6 +296,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.id[:, 0, 0] = 1
         self.id[:, 1, 1] = 1
         
+        self.ball_last_vel = torch.zeros((self.num_envs, 1, 3), device=self.device)
         self.last_linear_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
         self.last_angular_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
         self.last_linear_a = torch.zeros(self.num_envs, self.num_drones, device=self.device)
@@ -304,6 +305,9 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.last_angular_jerk = torch.zeros(self.num_envs, self.num_drones, device=self.device)
         self.prev_actions = torch.zeros(self.num_envs, self.num_drones, 4, device=self.device)
         self.reward_action_smoothness_weight: float = cfg.task.reward_action_smoothness_weight
+
+        self.racket_near_ball = torch.zeros((cfg.task.env.num_envs, 1), device=self.device, dtype=torch.bool)
+        self.drone_near_ball = torch.zeros((cfg.task.env.num_envs, 1), device=self.device, dtype=torch.bool)
 
     def _design_scene(self):
         drone_model = MultirotorBase.REGISTRY[self.cfg.task.drone_model]
@@ -322,8 +326,9 @@ class MultiJuggleVolleyball(IsaacEnv):
             color=torch.tensor([1.0, 0.2, 0.2]),
             physics_material=material,
         )
-        cr_api = PhysxSchema.PhysxContactReportAPI.Apply(ball.prim)
-        cr_api.CreateThresholdAttr().Set(0.0)
+
+        # cr_api = PhysxSchema.PhysxContactReportAPI.Apply(ball.prim)
+        # cr_api.CreateThresholdAttr().Set(0.0)
 
         if self.use_local_usd:
             # use local usd resources
@@ -356,8 +361,6 @@ class MultiJuggleVolleyball(IsaacEnv):
             binding_api = UsdShade.MaterialBindingAPI(collision_prim)
             binding_api.Bind(material, UsdShade.Tokens.weakerThanDescendants, "physics")
 
-            cr_api_drone = PhysxSchema.PhysxContactReportAPI.Apply(collision_prim)
-            cr_api_drone.CreateThresholdAttr().Set(0.0)
 
         return ["/World/defaultGroundPlane"]
 
@@ -565,7 +568,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.stats = stats_spec.zero()
         self.info = info_spec.zero()
 
-    def check_ball_near_racket(self):
+    def check_ball_near_racket(self, racket_radius, cylinder_height_coeff):
         z_direction_local = torch.tensor([0.0, 0.0, 1.0], device=self.device)
         z_direction_world = quat_rotate(self.drone_rot, z_direction_local)  # (E, 2, 3)
 
@@ -576,7 +579,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         )  # (E, 2, 3)
 
         cylinder_bottom_center = self.drone.pos + normal_vector_world * 0.055  # (E, 2, 3) cylinder bottom center
-        cylinder_axis = 2.0 * self.ball_radius * normal_vector_world
+        cylinder_axis = cylinder_height_coeff * self.ball_radius * normal_vector_world
 
         ball_to_bottom = self.ball_pos - cylinder_bottom_center  # (E, 2, 3)
         projection_ratio = torch.sum(
@@ -592,7 +595,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         distance_to_axis = torch.norm(
             self.ball_pos - projection_point, dim=-1
         )  # (E, 2)
-        within_radius = distance_to_axis <= self.racket_radius  # (E, 2)
+        within_radius = distance_to_axis <= racket_radius  # (E, 2)
 
         return within_height & within_radius  # (E, 2)
 
@@ -722,7 +725,9 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.last_hit_step[env_ids] = -100.0
         self.last_cross_step[env_ids] = -100.0
         self.stats[env_ids] = 0.0
+        
 
+        self.ball_last_vel[env_ids] = torch.zeros_like(self.ball_last_vel[env_ids])
         self.last_linear_v[env_ids] = torch.zeros_like(self.last_linear_v[env_ids])
         self.last_angular_v[env_ids] = torch.zeros_like(self.last_angular_v[env_ids])
         self.last_linear_a[env_ids] = torch.zeros_like(self.last_linear_a[env_ids])
@@ -734,6 +739,9 @@ class MultiJuggleVolleyball(IsaacEnv):
         cmd_init = 2.0 * (self.drone.throttle[env_ids]) ** 2 - 1.0
         self.info['prev_action'][env_ids, :, 3] = cmd_init.mean(dim=-1)
         self.prev_actions[env_ids] = self.info['prev_action'][env_ids].clone()
+
+        self.racket_near_ball[env_ids] = False
+        self.drone_near_ball[env_ids] = False
 
         # draw
         if (env_ids == self.central_env_idx).any() and self._should_render(0):
@@ -771,7 +779,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.effort = self.drone.apply_action(actions)
 
     def _post_sim_step(self, tensordict: TensorDictBase):
-        self.contact_sensor.update(self.dt)
+        # self.contact_sensor.update(self.dt)
+        pass
 
     def _compute_state_and_obs(self):
         # clone here
@@ -780,6 +789,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.info["drone_state"][:] = self.root_state[..., :13]
         self.ball_pos, _ = self.get_env_poses(self.ball.get_world_poses())
         self.ball_vel = self.ball.get_velocities()[..., :3]
+        self.ball_linear_vel = self.ball.get_velocities()[..., :3]
 
         # relative position and heading
         self.rpos_ball = self.drone.pos - self.ball_pos
@@ -891,7 +901,29 @@ class MultiJuggleVolleyball(IsaacEnv):
             self.num_envs,
         )
 
+    def check_hit(self, sim_dt, racket_radius=0.2, cylinder_height_coeff=2.0):
+        racket_near_ball_last_step = self.racket_near_ball.clone()
+        drone_near_ball_last_step = self.drone_near_ball.clone()
+
+        self.racket_near_ball = self.check_ball_near_racket(racket_radius=racket_radius, cylinder_height_coeff=cylinder_height_coeff)  # (E,N)
+        self.drone_near_ball = (torch.norm(self.rpos_ball, dim=-1) < 0.2) # (E,N)
+
+        ball_vel_z_change = ((self.ball_linear_vel[..., 2] - self.ball_last_vel[..., 2]) > 9.8 * sim_dt) # (E,1)
+        ball_vel_x_y_change = (self.ball_linear_vel[..., :2] - self.ball_last_vel[..., :2]).norm(dim=-1) > 0.5 # (E,1)
+        ball_vel_change = ball_vel_z_change | ball_vel_x_y_change # (E,1)
+        
+        drone_hit_ball = (drone_near_ball_last_step | self.drone_near_ball) & ball_vel_change # (E,N)
+        racket_hit_ball = (racket_near_ball_last_step | self.racket_near_ball) & ball_vel_change # (E,N)
+        racket_hit_ball = racket_hit_ball & (self.progress_buf.unsqueeze(-1) - self.last_hit_step > 3) # (E,N)
+        drone_hit_ball = drone_hit_ball & (self.progress_buf.unsqueeze(-1) - self.last_hit_step > 3) # (E,N)
+
+        return racket_hit_ball, drone_hit_ball
+
     def _compute_reward_and_done(self):
+        racket_hit_ball, drone_hit_ball = self.check_hit(sim_dt=self.dt,racket_radius=self.racket_radius)
+        # hit = racket_hit_ball # (E, 1)
+        any_hit = racket_hit_ball | drone_hit_ball
+
         # ball misbehave # 检查球的违规行为
         ball_too_low = self.ball_pos[..., 2] < 2 * self.ball_radius  # (E, 1) # 检查球是否过低（低于两倍球半径）
         ball_too_high = self.ball_pos[..., 2] > 16  # (E, 1) # 检查球是否过高（高于16米）
@@ -907,14 +939,14 @@ class MultiJuggleVolleyball(IsaacEnv):
         drone_misbehave = drone_too_low | drone_hit_net  # (E, 2) # 无人机的违规行为（过低或撞网）
 
         # drone hit ball # 检查无人机击球
-        ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3) # 获取球的接触力（世界坐标系）
+        # ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3) # 获取球的接触力（世界坐标系）
         hit_drone: torch.Tensor = self.rpos_ball.norm(p=2, dim=-1).argmin( # (E, 1) # 计算哪个无人机离球更近（argmin返回索引0或1）
             dim=1, keepdim=True
         )  
-        sim_hit = torch.zeros( # (E, 2) # 初始化一个布尔张量，用于标记模拟中发生的碰撞
+        sim_hit = torch.zeros( 
             self.num_envs, 2, device=self.device, dtype=torch.bool
         )  
-        sim_hit[turn_to_mask(hit_drone)] = ball_contact_forces.any(-1).squeeze(-1) # 如果球受到了接触力，标记离球最近的那个无人机为“模拟击球”
+        sim_hit[turn_to_mask(hit_drone)] = any_hit.any(-1).squeeze(-1) # 标记离球最近的那个无人机为“模拟击球”
 
         # 判断击球是否为有效（非连续）
         true_hit_step_gap = 3 # 定义两次“真实击球”之间的最小时间步间隔
@@ -924,8 +956,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         wrong_hit_sim = sim_hit & ( # “错误模拟击球”= 模拟击球 但是 距离上次击球时间 <= 间隔（即连续碰撞）
             (self.progress_buf.unsqueeze(-1) - self.last_hit_step) <= true_hit_step_gap
         )
-        # self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
-        self.last_hit_step[true_hit] = self.progress_buf[true_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
+        self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # 更新发生了模拟击球的环境的“最后击球时间”
 
         # 检查是否由正确回合的无人机击球
         wrong_hit_turn: torch.Tensor = true_hit & ( # “错误回合击球”= 真实击球 并且 击球的无人机不是当前回合的无人机
@@ -933,12 +964,12 @@ class MultiJuggleVolleyball(IsaacEnv):
         )
     
         # 检测是否拍打到球 # 检查球是否在球拍范围内
-        ball_near_racket = self.check_ball_near_racket() # (E, 2) # 检查球是否在无人机的球拍（圆柱体）范围内
+        ball_near_racket = self.check_ball_near_racket(racket_radius=self.racket_radius, cylinder_height_coeff=2.0) # (E, 2) # 检查球是否在无人机的球拍（圆柱体）范围内
         wrong_hit_racket = true_hit & torch.logical_not(ball_near_racket) # “错误球拍击球”= 真实击球 并且 球不在球拍范围内
         wrong_hit = wrong_hit_turn | wrong_hit_racket # “错误击球”= 错误回合 或 错误球拍
         success_hit = true_hit & torch.logical_not(wrong_hit) # “成功击球”= 真实击球 并且 不是错误击球
 
-        self.turn = (self.turn + success_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
+        self.turn = (self.turn + true_hit.any(dim=-1, keepdim=True)) % 2 # 如果有成功击球，则切换回合（0变1，1变0）
 
         # ball cross middle # 检查球是否过网
         true_cross_step_gap = 3 # 定义两次“真实过网”之间的最小时间步间隔
@@ -957,6 +988,8 @@ class MultiJuggleVolleyball(IsaacEnv):
             self.debug_draw_min_height(ball_cross[self.central_env_idx, 0]) # 绘制最小过网高度的可视化标记
             if success_hit[self.central_env_idx].any(): # 如果中心环境发生了成功击球
                 self.debug_draw_turn() # 绘制当前回合的可视化标记
+        
+        self.ball_last_vel = self.ball_linear_vel.clone()
 
         # misbehave penalty # 计算违规行为惩罚
         _misbehave_penalty_coeff = 10.0 # 违规行为惩罚系数
@@ -1009,8 +1042,8 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         _direction_reward_coeff = 1.0 # 击球方向奖励系数
         target_dir_xy = ( # 目标方向（从当前回合无人机指向对方无人机）的XY向量
-            self.drone.pos[turn_to_mask(~self.turn)]
-            - self.drone.pos[turn_to_mask(self.turn)]
+            self.drone.pos[turn_to_mask(self.turn)]
+            - self.drone.pos[turn_to_mask(~self.turn)]
         )[
             ..., :2
         ]  # (E, 2)
