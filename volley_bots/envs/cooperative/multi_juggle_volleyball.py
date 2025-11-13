@@ -1012,7 +1012,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         )  # (E, 2)
 
         # task reward # 计算任务奖励
-        _task_reward_coeff = 5.0  # 1.0,10.0 # 任务奖励系数
+        _task_reward_coeff = 10.0  # 1.0,10.0 # 任务奖励系数
         reward_success_hit = _task_reward_coeff * success_hit.any( # 成功击球的奖励（共享，稀疏）
             -1, keepdim=True
         )  # share, sparse, (E, 1)
@@ -1020,7 +1020,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             _task_reward_coeff * success_cross
         )  # share, sparse, (E, 1)
 
-        _dist_coeff = 0.05  # 0.05,0.03 # 距离惩罚系数
+        _dist_coeff = 0.2  # 0.05,0.03 # 距离惩罚系数
         dist_to_anchor = torch.norm(self.drone.pos - self.anchor, p=2, dim=-1)  # (E, 2) # 计算无人机到其锚点（anchor）的距离
         penalty_dist_to_anchor = _dist_coeff * ( # 距离锚点过远（超过半径）的惩罚
             dist_to_anchor - self.anchor_radius
