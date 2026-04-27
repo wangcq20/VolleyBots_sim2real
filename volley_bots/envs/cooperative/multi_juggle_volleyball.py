@@ -309,6 +309,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.racket_near_ball = torch.zeros((cfg.task.env.num_envs, 1), device=self.device, dtype=torch.bool)
         self.drone_near_ball = torch.zeros((cfg.task.env.num_envs, 1), device=self.device, dtype=torch.bool)
 
+        self.KD = torch.zeros(self.num_envs, device=self.device)
+
     def _design_scene(self):
         drone_model = MultirotorBase.REGISTRY[self.cfg.task.drone_model]
         cfg = drone_model.cfg_cls(force_sensor=self.cfg.task.force_sensor)
@@ -316,7 +318,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         material = materials.PhysicsMaterial(
             prim_path="/World/Physics_Materials/physics_material_0",
-            restitution=0.8,
+            restitution=0.6,
         )
 
         ball = objects.DynamicSphere(
@@ -365,7 +367,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         return ["/World/defaultGroundPlane"]
 
     def _set_specs(self):
-        drone_state_dim = self.drone.state_spec.shape[-1]
+        # drone_state_dim = self.drone.state_spec.shape[-1]
+        drone_state_dim = 15
         observation_dim = (
             drone_state_dim + 3 + 3 + 3 + 3 + 3 + 2 + 2
         )  # specified in function _compute_state_and_obs
@@ -482,8 +485,11 @@ class MultiJuggleVolleyball(IsaacEnv):
                 "task_reward": UnboundedContinuousTensorSpec(1),
                 "reward_success_hit": UnboundedContinuousTensorSpec(1),
                 "reward_success_cross": UnboundedContinuousTensorSpec(1),
+                "reward_upward_ball_vel": UnboundedContinuousTensorSpec(1),
+                "reward_catch_height": UnboundedContinuousTensorSpec(1),
                 "penalty_dist_to_anchor": UnboundedContinuousTensorSpec(1),
                 "penalty_yaw": UnboundedContinuousTensorSpec(1),
+                "penalty_roll": UnboundedContinuousTensorSpec(1),
 
                 "action_error_order1_mean": UnboundedContinuousTensorSpec(1),
                 "action_error_order1_max": UnboundedContinuousTensorSpec(1),
@@ -746,6 +752,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.racket_near_ball[env_ids] = False
         self.drone_near_ball[env_ids] = False
 
+        self.KD[env_ids] = 0.08
         # draw
         if (env_ids == self.central_env_idx).any() and self._should_render(0):
             self.ball_traj_vis.clear()
@@ -765,6 +772,9 @@ class MultiJuggleVolleyball(IsaacEnv):
                 _carb_float3_add(p, self.central_env_pos) for p in point_list_2
             ]
             self.draw.draw_lines(point_list_1, point_list_2, colors, sizes)
+    
+    def cal_air_drag(self, m: torch.Tensor, v: torch.Tensor, Kd: float) -> torch.Tensor:
+        return -Kd*m*v*v.norm(dim=-1, keepdim=True)
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
         actions = tensordict[("agents", "action")].clone()
@@ -778,6 +788,12 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.action_error_order1 = tensordict[("stats", "action_error_order1")].clone()
         self.stats["action_error_order1_mean"].add_(self.action_error_order1.mean(dim=-1).unsqueeze(-1))
         self.stats["action_error_order1_max"].set_(torch.max(self.stats["action_error_order1_max"], self.action_error_order1.mean(dim=-1).unsqueeze(-1)))
+
+        v = self.ball.get_velocities()[:,:, :3]  # (E,3)
+        m = self.ball.get_masses().view(self.num_envs, 1, 1)
+        kd = self.KD.view(self.num_envs, 1, 1)
+        f = self.cal_air_drag(m, v, kd)  # (E,3)
+        self.ball.apply_forces(f)
 
         self.effort = self.drone.apply_action(actions)
 
@@ -797,8 +813,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         # relative position and heading
         self.rpos_ball = self.drone.pos - self.ball_pos
 
-        pos, rot, vel, angular_vel, heading, up, throttle = torch.split(
-            self.root_state, split_size_or_sections=[3, 4, 3, 3, 3, 3, 4], dim=-1
+        pos, rot, vel, angular_vel, linear_vel_b, angular_vel_b, heading, lateral, up, throttle = torch.split(
+            self.root_state, split_size_or_sections=[3, 4, 3, 3, 3, 3, 3, 3, 3, 4], dim=-1
         )
         rot = torch.where((rot[..., 0] < 0).unsqueeze(-1), -rot, rot)
         self.drone_rot = rot
@@ -829,7 +845,13 @@ class MultiJuggleVolleyball(IsaacEnv):
         rpos_anchor = self.drone.pos - self.anchor  # (E,2,3)
 
         obs = [
-            self.root_state,  # (E,2,23)
+            pos,
+            # rot, # w of (w,x,y,z) is positive
+            vel,
+            # angular_vel,
+            heading,
+            lateral, # [E, 1, 3]
+            up,
             self.ball_pos.expand(-1, 2, 3), #(E,2,3)
             rpos_anchor,  # (E,2,3)
             self.rpos_drone[..., :3],  # (E,2,3)
@@ -928,364 +950,400 @@ class MultiJuggleVolleyball(IsaacEnv):
         # hit = racket_hit_ball # (E, 1)
         any_hit = racket_hit_ball | drone_hit_ball
 
-        # ball misbehave # ¼ì²éÇòµÄÎ¥¹æÐÐÎª
-        ball_too_low = self.ball_pos[..., 2] < 2 * self.ball_radius  # (E, 1) # ¼ì²éÇòÊÇ·ñ¹ýµÍ£¨µÍÓÚÁ½±¶Çò°ë¾¶£©
-        ball_too_high = self.ball_pos[..., 2] > 16  # (E, 1) # ¼ì²éÇòÊÇ·ñ¹ý¸ß£¨¸ßÓÚ16Ã×£©
-        ball_hit_net = self.check_hit_net(self.ball_pos, self.ball_radius)  # (E, 1) # ¼ì²éÇòÊÇ·ñ×²Íø
-        ball_out_of_court = self.check_out_of_court(self.ball_pos)  # (E, 1) # ¼ì²éÇòÊÇ·ñ³ö½ç
-        ball_misbehave = ( # ÇòµÄÎ¥¹æÐÐÎª£¨¹ýµÍ¡¢¹ý¸ß¡¢×²Íø¡¢³ö½çÖÐÈÎÒâÒ»Ïî£©
-            ball_too_low | ball_too_high | ball_hit_net | ball_out_of_court
+        # ball misbehave # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¥ï¿½ï¿½ï¿½ï¿½Îª
+        ball_too_low = self.ball_pos[..., 2] < 2 * self.ball_radius  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½Í£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ë¾¶ï¿½ï¿½
+        ball_too_high = self.ball_pos[..., 2] > 3.2  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ß£ï¿½ï¿½ï¿½ï¿½ï¿½16ï¿½×£ï¿½\
+        ball_too_fast = self.ball_linear_vel[..., 1].abs() > 6.0  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ß£ï¿½ï¿½ï¿½ï¿½ï¿½16ï¿½×£ï¿½
+        ball_hit_net = self.check_hit_net(self.ball_pos, self.ball_radius)  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½×²ï¿½ï¿½
+        ball_out_of_court = self.check_out_of_court(self.ball_pos)  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½
+        ball_misbehave = ( # ï¿½ï¿½ï¿½Î¥ï¿½ï¿½ï¿½ï¿½Îªï¿½ï¿½ï¿½ï¿½ï¿½Í¡ï¿½ï¿½ï¿½ï¿½ß¡ï¿½×²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½î£©
+            ball_too_low | ball_too_high | ball_too_fast | ball_hit_net | ball_out_of_court
         )  # (E, 1)
 
-        # drone misbehave # ¼ì²éÎÞÈË»úµÄÎ¥¹æÐÐÎª
-        drone_too_low = self.drone.pos[..., 2] < 2 * self.racket_radius  # (E, 2) # ¼ì²éÎÞÈË»úÊÇ·ñ¹ýµÍ£¨µÍÓÚÁ½±¶ÇòÅÄ°ë¾¶£©
-        drone_hit_net = self.check_hit_net(self.drone.pos, self.racket_radius)  # (E, 2) # ¼ì²éÎÞÈË»úÊÇ·ñ×²Íø
-        drone_misbehave = drone_too_low | drone_hit_net  # (E, 2) # ÎÞÈË»úµÄÎ¥¹æÐÐÎª£¨¹ýµÍ»ò×²Íø£©
+        # drone misbehave # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½Î¥ï¿½ï¿½ï¿½ï¿½Îª
+        drone_too_low = self.drone.pos[..., 2] < 2 * self.racket_radius
+        drone_too_high = self.drone.pos[..., 2] > 2.5
+        drone_hit_net = self.check_hit_net(self.drone.pos, self.racket_radius)  # (E, 2) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½Ç·ï¿½×²ï¿½ï¿½
+        drone_misbehave = drone_too_low | drone_too_high | drone_hit_net  # (E, 2) # ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½Î¥ï¿½ï¿½ï¿½ï¿½Îªï¿½ï¿½ï¿½ï¿½ï¿½Í»ï¿½×²ï¿½ï¿½ï¿½ï¿½
 
-        # drone hit ball # ¼ì²éÎÞÈË»ú»÷Çò
-        # ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3) # »ñÈ¡ÇòµÄ½Ó´¥Á¦£¨ÊÀ½ç×ø±êÏµ£©
-        hit_drone: torch.Tensor = self.rpos_ball.norm(p=2, dim=-1).argmin( # (E, 1) # ¼ÆËãÄÄ¸öÎÞÈË»úÀëÇò¸ü½ü£¨argmin·µ»ØË÷Òý0»ò1£©
+        # drone hit ball # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½
+        # ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3) # ï¿½ï¿½È¡ï¿½ï¿½Ä½Ó´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ïµï¿½ï¿½
+        hit_drone: torch.Tensor = self.rpos_ball.norm(p=2, dim=-1).argmin( # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½Ä¸ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½argminï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½0ï¿½ï¿½1ï¿½ï¿½
             dim=1, keepdim=True
         )  
         sim_hit = torch.zeros( 
             self.num_envs, 2, device=self.device, dtype=torch.bool
         )  
-        sim_hit[turn_to_mask(hit_drone)] = any_hit.any(-1).squeeze(-1) # ±ê¼ÇÀëÇò×î½üµÄÄÇ¸öÎÞÈË»úÎª¡°Ä£Äâ»÷Çò¡±
+        sim_hit[turn_to_mask(hit_drone)] = any_hit.any(-1).squeeze(-1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç¸ï¿½ï¿½ï¿½ï¿½Ë»ï¿½Îªï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½
 
-        # ÅÐ¶Ï»÷ÇòÊÇ·ñÎªÓÐÐ§£¨·ÇÁ¬Ðø£©
-        true_hit_step_gap = 3 # ¶¨ÒåÁ½´Î¡°ÕæÊµ»÷Çò¡±Ö®¼äµÄ×îÐ¡Ê±¼ä²½¼ä¸ô
-        true_hit = sim_hit & ( # ¡°ÕæÊµ»÷Çò¡±= Ä£Äâ»÷Çò ²¢ÇÒ ¾àÀëÉÏ´Î»÷ÇòÊ±¼ä > ¼ä¸ô
+        # ï¿½Ð¶Ï»ï¿½ï¿½ï¿½ï¿½Ç·ï¿½Îªï¿½ï¿½Ð§ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        true_hit_step_gap = 3 # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¡ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½Ö®ï¿½ï¿½ï¿½ï¿½ï¿½Ð¡Ê±ï¿½ä²½ï¿½ï¿½ï¿½
+        true_hit = sim_hit & ( # ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½= Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½Ï´Î»ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ > ï¿½ï¿½ï¿½
             (self.progress_buf.unsqueeze(-1) - self.last_hit_step) > true_hit_step_gap
         )
-        wrong_hit_sim = sim_hit & ( # ¡°´íÎóÄ£Äâ»÷Çò¡±= Ä£Äâ»÷Çò µ«ÊÇ ¾àÀëÉÏ´Î»÷ÇòÊ±¼ä <= ¼ä¸ô£¨¼´Á¬ÐøÅö×²£©
+        wrong_hit_sim = sim_hit & ( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½= Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½Ï´Î»ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ <= ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½×²ï¿½ï¿½
             (self.progress_buf.unsqueeze(-1) - self.last_hit_step) <= true_hit_step_gap
         )
-        self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # ¸üÐÂ·¢ÉúÁËÄ£Äâ»÷ÇòµÄ»·¾³µÄ¡°×îºó»÷ÇòÊ±¼ä¡±
+        self.last_hit_step[sim_hit] = self.progress_buf[sim_hit.any(-1)] # ï¿½ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½ï¿½Ä¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ä¡±
 
-        # ¼ì²éÊÇ·ñÓÉÕýÈ·»ØºÏµÄÎÞÈË»ú»÷Çò
-        wrong_hit_turn: torch.Tensor = true_hit & ( # ¡°´íÎó»ØºÏ»÷Çò¡±= ÕæÊµ»÷Çò ²¢ÇÒ »÷ÇòµÄÎÞÈË»ú²»ÊÇµ±Ç°»ØºÏµÄÎÞÈË»ú
+        # ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½È·ï¿½ØºÏµï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½
+        wrong_hit_turn: torch.Tensor = true_hit & ( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ØºÏ»ï¿½ï¿½ï¿½= ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½Çµï¿½Ç°ï¿½ØºÏµï¿½ï¿½ï¿½ï¿½Ë»ï¿½
             self.turn != hit_drone
         )
     
-        # ¼ì²âÊÇ·ñÅÄ´òµ½Çò # ¼ì²éÇòÊÇ·ñÔÚÇòÅÄ·¶Î§ÄÚ
-        ball_near_racket = self.check_ball_near_racket(racket_radius=self.racket_radius, cylinder_height_coeff=2.0) # (E, 2) # ¼ì²éÇòÊÇ·ñÔÚÎÞÈË»úµÄÇòÅÄ£¨Ô²ÖùÌå£©·¶Î§ÄÚ
-        wrong_hit_racket = true_hit & torch.logical_not(ball_near_racket) # ¡°´íÎóÇòÅÄ»÷Çò¡±= ÕæÊµ»÷Çò ²¢ÇÒ Çò²»ÔÚÇòÅÄ·¶Î§ÄÚ
-        wrong_hit = wrong_hit_turn | wrong_hit_racket # ¡°´íÎó»÷Çò¡±= ´íÎó»ØºÏ »ò ´íÎóÇòÅÄ
-        success_hit = true_hit & torch.logical_not(wrong_hit) # ¡°³É¹¦»÷Çò¡±= ÕæÊµ»÷Çò ²¢ÇÒ ²»ÊÇ´íÎó»÷Çò
+        # ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½Ä´ï¿½ï¿½ï¿½ # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä·ï¿½Î§ï¿½ï¿½
+        ball_near_racket = self.check_ball_near_racket(racket_radius=self.racket_radius, cylinder_height_coeff=2.0) # (E, 2) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£ï¿½Ô²ï¿½ï¿½ï¿½å£©ï¿½ï¿½Î§ï¿½ï¿½
+        wrong_hit_racket = true_hit & torch.logical_not(ball_near_racket) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½= ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä·ï¿½Î§ï¿½ï¿½
+        wrong_hit = wrong_hit_turn | wrong_hit_racket # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½= ï¿½ï¿½ï¿½ï¿½Øºï¿½ ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        success_hit = true_hit & torch.logical_not(wrong_hit) # ï¿½ï¿½ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½= ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½Ç´ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
 
-        self.turn = (self.turn + true_hit.any(dim=-1, keepdim=True)) % 2 # Èç¹ûÓÐ³É¹¦»÷Çò£¬ÔòÇÐ»»»ØºÏ£¨0±ä1£¬1±ä0£©
+        self.turn = (self.turn + true_hit.any(dim=-1, keepdim=True)) % 2 # ï¿½ï¿½ï¿½ï¿½Ð³É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð»ï¿½ï¿½ØºÏ£ï¿½0ï¿½ï¿½1ï¿½ï¿½1ï¿½ï¿½0ï¿½ï¿½
 
-        # ball cross middle # ¼ì²éÇòÊÇ·ñ¹ýÍø
-        true_cross_step_gap = 3 # ¶¨ÒåÁ½´Î¡°ÕæÊµ¹ýÍø¡±Ö®¼äµÄ×îÐ¡Ê±¼ä²½¼ä¸ô
-        ball_cross = self.ball_pos[..., 1].abs() <= self.ball_radius  # (E, 1) # ¼ì²éÇòÊÇ·ñÔÚÇòÍø£¨y=0£©¸½½ü£¨Ò»¸öÇò°ë¾¶ÄÚ£©
-        true_cross = ball_cross & ( # ¡°ÕæÊµ¹ýÍø¡±= ÇòÔÚÇòÍø¸½½ü ²¢ÇÒ ¾àÀëÉÏ´Î¹ýÍøÊ±¼ä > ¼ä¸ô
+        # ball cross middle # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½
+        true_cross_step_gap = 3 # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¡ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö®ï¿½ï¿½ï¿½ï¿½ï¿½Ð¡Ê±ï¿½ä²½ï¿½ï¿½ï¿½
+        ball_cross = self.ball_pos[..., 1].abs() <= self.ball_radius  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½y=0ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½ë¾¶ï¿½Ú£ï¿½
+        true_cross = ball_cross & ( # ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½= ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½Ï´Î¹ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ > ï¿½ï¿½ï¿½
             self.progress_buf.unsqueeze(-1) - self.last_cross_step > true_cross_step_gap
         )  # (E, 1)
-        above_min_height = self.ball_pos[..., 2] > self.min_height  # (E, 1) # ¼ì²éÇòµÄ¸ß¶ÈÊÇ·ñ¸ßÓÚÒªÇóµÄ×îÐ¡¸ß¶È
-        success_cross = true_cross & above_min_height  # (E, 1) # ¡°³É¹¦¹ýÍø¡±= ÕæÊµ¹ýÍø ²¢ÇÒ ¸ßÓÚ×îÐ¡¸ß¶È
-        self.last_cross_step[ball_cross] = self.progress_buf[ball_cross.squeeze(-1)] # ¸üÐÂ·¢ÉúÁËÇò¹ýÍøµÄ»·¾³µÄ¡°×îºó¹ýÍøÊ±¼ä¡±
+        above_min_height = self.ball_pos[..., 2] > self.min_height  # (E, 1) # ï¿½ï¿½ï¿½ï¿½ï¿½Ä¸ß¶ï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½ï¿½ï¿½ï¿½Ð¡ï¿½ß¶ï¿½
+        success_cross = true_cross & above_min_height  # (E, 1) # ï¿½ï¿½ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½= ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð¡ï¿½ß¶ï¿½
+        self.last_cross_step[ball_cross] = self.progress_buf[ball_cross.squeeze(-1)] # ï¿½ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½ï¿½Ä¡ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ä¡±
 
-        if self._should_render(0): # Èç¹ûÐèÒªäÖÈ¾£¨Í¨³£ÊÇÖÐÐÄ»·¾³£©
-            self.debug_draw_hit_racket( # »æÖÆ»÷ÇòºÍÇòÅÄ¼ì²âµÄ¿ÉÊÓ»¯±ê¼Ç
+        if self._should_render(0): # ï¿½ï¿½ï¿½ï¿½ï¿½Òªï¿½ï¿½È¾ï¿½ï¿½Í¨ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½ï¿½ï¿½
+            self.debug_draw_hit_racket( # ï¿½ï¿½ï¿½Æ»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼ï¿½ï¿½Ä¿ï¿½ï¿½Ó»ï¿½ï¿½ï¿½ï¿½
                 true_hit[self.central_env_idx], ball_near_racket[self.central_env_idx]
             )
-            self.debug_draw_min_height(ball_cross[self.central_env_idx, 0]) # »æÖÆ×îÐ¡¹ýÍø¸ß¶ÈµÄ¿ÉÊÓ»¯±ê¼Ç
-            if success_hit[self.central_env_idx].any(): # Èç¹ûÖÐÐÄ»·¾³·¢ÉúÁË³É¹¦»÷Çò
-                self.debug_draw_turn() # »æÖÆµ±Ç°»ØºÏµÄ¿ÉÊÓ»¯±ê¼Ç
+            self.debug_draw_min_height(ball_cross[self.central_env_idx, 0]) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð¡ï¿½ï¿½ï¿½ï¿½ï¿½ß¶ÈµÄ¿ï¿½ï¿½Ó»ï¿½ï¿½ï¿½ï¿½
+            if success_hit[self.central_env_idx].any(): # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë³É¹ï¿½ï¿½ï¿½ï¿½ï¿½
+                self.debug_draw_turn() # ï¿½ï¿½ï¿½Æµï¿½Ç°ï¿½ØºÏµÄ¿ï¿½ï¿½Ó»ï¿½ï¿½ï¿½ï¿½
         
         self.ball_last_vel = self.ball_linear_vel.clone()
 
-        # misbehave penalty # ¼ÆËãÎ¥¹æÐÐÎª³Í·£
-        _misbehave_penalty_coeff = 10.0 # Î¥¹æÐÐÎª³Í·£ÏµÊý
-        penalty_ball_misbehave = ( # ÇòÎ¥¹æµÄ³Í·££¨¹²Ïí£¬Ï¡Êè£©
+        # misbehave penalty # ï¿½ï¿½ï¿½ï¿½Î¥ï¿½ï¿½ï¿½ï¿½Îªï¿½Í·ï¿½
+        _misbehave_penalty_coeff = 5.0 # Î¥ï¿½ï¿½ï¿½ï¿½Îªï¿½Í·ï¿½Ïµï¿½ï¿½
+        penalty_ball_misbehave = ( # ï¿½ï¿½Î¥ï¿½ï¿½Ä³Í·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¡ï¿½è£©
             _misbehave_penalty_coeff * ball_misbehave
         )  # share, sparse, (E, 1)
-        penalty_drone_misbehave = ( # ÎÞÈË»úÎ¥¹æµÄ³Í·££¨¶ÀÁ¢£¬Ï¡Êè£©
-            _misbehave_penalty_coeff * drone_misbehave
+        penalty_drone_misbehave = ( # ï¿½ï¿½ï¿½Ë»ï¿½Î¥ï¿½ï¿½Ä³Í·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¡ï¿½è£©
+            2 * _misbehave_penalty_coeff * drone_misbehave
         )  # individual, sparse, (E, 2)
-        penalty_wrong_hit = ( # ´íÎó»÷ÇòµÄ³Í·££¨¶ÀÁ¢£¬Ï¡Êè£©
+        penalty_wrong_hit = ( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä³Í·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¡ï¿½è£©
             _misbehave_penalty_coeff * wrong_hit
         )  # individual, sparse, (E, 2)
 
-        misbehave_penalty = ( # ×ÜµÄÎ¥¹æ³Í·££¨(E, 2)£¬Í¨¹ý¹ã²¥Ïà¼Ó£©
+        misbehave_penalty = ( # ï¿½Üµï¿½Î¥ï¿½ï¿½Í·ï¿½ï¿½ï¿½(E, 2)ï¿½ï¿½Í¨ï¿½ï¿½ï¿½ã²¥ï¿½ï¿½Ó£ï¿½
             penalty_ball_misbehave + penalty_drone_misbehave + penalty_wrong_hit
         )  # (E, 2)
 
-        # task reward # ¼ÆËãÈÎÎñ½±Àø
-        _task_reward_coeff = 10.0  # 1.0,10.0 # ÈÎÎñ½±ÀøÏµÊý
-        reward_success_hit = _task_reward_coeff * success_hit.any( # ³É¹¦»÷ÇòµÄ½±Àø£¨¹²Ïí£¬Ï¡Êè£©
+        # task reward # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        _task_reward_coeff = 20.0  # 1.0,10.0 # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ïµï¿½ï¿½
+        reward_success_hit = _task_reward_coeff * success_hit.any( # ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ä½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¡ï¿½è£©
             -1, keepdim=True
         )  # share, sparse, (E, 1)
-        reward_success_cross = ( # ³É¹¦¹ýÍøµÄ½±Àø£¨¹²Ïí£¬Ï¡Êè£©
+        reward_success_cross = ( # ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¡ï¿½è£©
             _task_reward_coeff * success_cross
         )  # share, sparse, (E, 1)
-
-        _dist_coeff = 0.2  # 0.05,0.03 # ¾àÀë³Í·£ÏµÊý
-        dist_to_anchor = torch.norm(self.drone.pos - self.anchor, p=2, dim=-1)  # (E, 2) # ¼ÆËãÎÞÈË»úµ½ÆäÃªµã£¨anchor£©µÄ¾àÀë
-        penalty_dist_to_anchor = _dist_coeff * ( # ¾àÀëÃªµã¹ýÔ¶£¨³¬¹ý°ë¾¶£©µÄ³Í·£
-            dist_to_anchor - self.anchor_radius
-        ).clamp(
-            min=0
-        )  # individual, sparse, (E, 2)
-        penalty_dist_to_anchor = penalty_dist_to_anchor.mean( # ½«Á½¸öÎÞÈË»úµÄ³Í·£Æ½¾ù£¨¹²Ïí£¬Ï¡Êè£©
-            -1, keepdim=True
+        _upward_ball_vel_reward_coeff = 5.0
+        reward_upward_ball_vel = (
+            _upward_ball_vel_reward_coeff
+            * (
+                success_hit.any(-1, keepdim=True)
+                & (self.ball_linear_vel[..., 2] > 2.0)
+            ).float()
         )  # share, sparse, (E, 1)
 
-        task_reward = reward_success_hit + reward_success_cross - penalty_dist_to_anchor # ×ÜµÄÈÎÎñ½±Àø
+        _catch_height_reward_coeff = 5.0
+        _catch_height_target = 1.5
+        _catch_height_tolerance = 0.2
+        catch_height_score = (
+            1.0
+            - (self.drone.pos[..., 2] - _catch_height_target).abs()
+            / _catch_height_tolerance
+        ).clamp(min=0.0, max=1.0)  # (E, 2)
+        reward_catch_height = (
+            _catch_height_reward_coeff
+            * (success_hit.float() * catch_height_score).sum(-1, keepdim=True)
+            / success_hit.float().sum(-1, keepdim=True).clamp(min=1.0)
+        )  # share, sparse, (E, 1)
 
-        # shaping reward # ¼ÆËãËÜÐÎ½±Àø
-        dist_to_ball_xy = torch.norm( # ¼ÆËãÎÞÈË»úµ½ÇòµÄXYÆ½Ãæ¾àÀë
-            self.drone.pos[..., :2] - self.ball_pos[..., :2], p=2, dim=-1
+        _dist_coeff = 0.2  # 0.05,0.03 # ï¿½ï¿½ï¿½ï¿½Í·ï¿½Ïµï¿½ï¿½
+        current_turn_mask = turn_to_mask(self.turn).float()  # (E, 2)
+        return_to_anchor_mask = 1.0 - current_turn_mask  # (E, 2)
+        dist_to_anchor = torch.norm(self.drone.pos - self.anchor, p=2, dim=-1)  # (E, 2) # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½Ãªï¿½ã£¨anchorï¿½ï¿½ï¿½Ä¾ï¿½ï¿½ï¿½
+        penalty_dist_to_anchor = _dist_coeff * return_to_anchor_mask * ( # Ö»ï¿½Çµï¿½Ç°ï¿½ØºÏµï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½Ãªï¿½ï¿½ï¿½Ô¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ë¾¶ï¿½ï¿½ï¿½Ä³Í·ï¿½
+            dist_to_anchor - self.anchor_radius
+        ).clamp(min=0)  # individual, sparse, (E, 2)
+        penalty_dist_to_anchor = penalty_dist_to_anchor.sum( # ï¿½Çµï¿½Ç°ï¿½ØºÏµï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ï¡ï¿½è£©
+            -1, keepdim=True
+        ) / return_to_anchor_mask.sum(-1, keepdim=True).clamp(min=1.0)  # share, sparse, (E, 1)
+
+        task_reward = (
+            reward_success_hit
+            + reward_success_cross
+            + reward_upward_ball_vel
+            + reward_catch_height
+            - penalty_dist_to_anchor
+        ) # ï¿½Üµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+
+        # shaping reward # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î½ï¿½ï¿½ï¿½
+        dist_to_ball = torch.norm( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½XYÆ½ï¿½ï¿½ï¿½ï¿½ï¿½
+            self.drone.pos - self.ball_pos, p=2, dim=-1
         )  # (E, 2)
-        reward_dist_to_ball = ( # ¿¿½üÇòµÄ½±Àø£¨ËÜÐÎ£©
-            _dist_coeff * (2 * turn_to_mask(self.turn) - 1) / (1 + dist_to_ball_xy) # (2*mask-1)Ê¹µÃµ±Ç°»ØºÏÎÞÈË»úÎªÕý½±Àø£¬ÁíÒ»ÎÞÈË»úÎª¸º½±Àø
+        reward_dist_to_ball = ( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î£ï¿½
+            _dist_coeff * current_turn_mask / (1 + dist_to_ball) # Ö»ï¿½ï¿½ï¿½ï¿½Ç°ï¿½ØºÏµï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
         )  # individual, dense, (E, 2)
         reward_drone_dist_to_ball = reward_dist_to_ball.clone()
-        reward_dist_to_ball = reward_dist_to_ball.mean( # ½«Á½¸öÎÞÈË»úµÄ½±ÀøÆ½¾ù£¨¹²Ïí£¬³íÃÜ£©
+        reward_dist_to_ball = reward_dist_to_ball.sum( # ï¿½ï¿½Ç°ï¿½ØºÏµï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½Ä½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ü£ï¿½
             -1, keepdim=True
-        )  # share, dense, (E, 1)
+        ) / current_turn_mask.sum(-1, keepdim=True).clamp(min=1.0)  # share, dense, (E, 1)
 
-        _direction_reward_coeff = 1.0 # »÷Çò·½Ïò½±ÀøÏµÊý
-        target_dir_xy = ( # Ä¿±ê·½Ïò£¨´Óµ±Ç°»ØºÏÎÞÈË»úÖ¸Ïò¶Ô·½ÎÞÈË»ú£©µÄXYÏòÁ¿
+        _direction_reward_coeff = 1.0 # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ïµï¿½ï¿½
+        target_dir_xy = ( # Ä¿ï¿½ê·½ï¿½ò£¨´Óµï¿½Ç°ï¿½Øºï¿½ï¿½ï¿½ï¿½Ë»ï¿½Ö¸ï¿½ï¿½Ô·ï¿½ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½ï¿½XYï¿½ï¿½ï¿½ï¿½
             self.drone.pos[turn_to_mask(self.turn)]
             - self.drone.pos[turn_to_mask(~self.turn)]
         )[
             ..., :2
         ]  # (E, 2)
-        ball_dir_xy = self.ball_vel[:, 0, :2]  # (E, 2) # ÇòµÄËÙ¶ÈÏòÁ¿£¨XYÆ½Ãæ£©
-        cosine_similarity = NNF.cosine_similarity( # ¼ÆËãÄ¿±ê·½ÏòºÍÇòËÙ¶È·½ÏòµÄÓàÏÒÏàËÆ¶È
+        ball_dir_xy = self.ball_vel[:, 0, :2]  # (E, 2) # ï¿½ï¿½ï¿½ï¿½Ù¶ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½XYÆ½ï¿½æ£©
+        cosine_similarity = NNF.cosine_similarity( # ï¿½ï¿½ï¿½ï¿½Ä¿ï¿½ê·½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ù¶È·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ¶ï¿½
             target_dir_xy, ball_dir_xy, dim=-1
         ).unsqueeze(
             -1
         )  # (E, 1)
-        reward_hit_direction = ( # »÷Çò·½Ïò½±Àø = ÏµÊý * ³É¹¦»÷Çò * ÏàËÆ¶È
+        reward_hit_direction = ( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ = Ïµï¿½ï¿½ * ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½ * ï¿½ï¿½ï¿½Æ¶ï¿½
             _direction_reward_coeff * success_hit * cosine_similarity
         )  # individual, sparse, (E, 2)
 
-        shaping_reward = reward_dist_to_ball + reward_hit_direction # ×ÜµÄËÜÐÎ½±Àø
+        shaping_reward = reward_dist_to_ball + reward_hit_direction # ï¿½Üµï¿½ï¿½ï¿½ï¿½Î½ï¿½ï¿½ï¿½
 
-        not_begin_flag = (self.progress_buf > 1).unsqueeze(1) # ±ê¼ÇÊÇ·ñ·Ç³õÊ¼²½Öè£¨>1£©£¬±ÜÃâÔÚµÚÒ»²½¼ÆËã
-        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.action_error_order1) * not_begin_flag.float() # ¶¯×÷Æ½»¬¶È½±Àø
+        not_begin_flag = (self.progress_buf > 1).unsqueeze(1) # ï¿½ï¿½ï¿½ï¿½Ç·ï¿½Ç³ï¿½Ê¼ï¿½ï¿½ï¿½è£¨>1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Úµï¿½Ò»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        reward_action_smoothness = self.reward_action_smoothness_weight * torch.exp(-self.action_error_order1) * not_begin_flag.float() # ï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½È½ï¿½ï¿½ï¿½
 
         _penalty_yaw_coeff = 0.03
         penalty_yaw = _penalty_yaw_coeff * self.yaw.abs()
 
-        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness - penalty_yaw # ×Ü½±Àø
+        _penalty_roll_coeff = 0.03
+        penalty_roll = _penalty_roll_coeff * (self.roll.abs() > 1.0)
 
-        # done # ¼ÆËã»ØºÏÊÇ·ñ½áÊø
-        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze( # ¼ì²éÊÇ·ñ´ïµ½×î´ó»ØºÏ³¤¶È£¨½Ø¶Ï£©
+        reward = -misbehave_penalty + task_reward + self.reward_shaping * shaping_reward + 0.8 * reward_action_smoothness - penalty_yaw - penalty_roll # ï¿½Ü½ï¿½ï¿½ï¿½
+
+        # done # ï¿½ï¿½ï¿½ï¿½Øºï¿½ï¿½Ç·ï¿½ï¿½ï¿½ï¿½
+        truncated = (self.progress_buf >= self.max_episode_length).unsqueeze( # ï¿½ï¿½ï¿½ï¿½Ç·ï¿½ïµ½ï¿½ï¿½ï¿½ØºÏ³ï¿½ï¿½È£ï¿½ï¿½Ø¶Ï£ï¿½
             -1
         )  # (E, 1)
-        terminated = ( # ¼ì²éÊÇ·ñ´¥·¢ÖÕÖ¹Ìõ¼þ£¨ÇòÎ¥¹æ¡¢ÎÞÈË»úÎ¥¹æ¡¢´íÎó»÷Çò£©
+        terminated = ( # ï¿½ï¿½ï¿½ï¿½Ç·ñ´¥·ï¿½ï¿½ï¿½Ö¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Î¥ï¿½æ¡¢ï¿½ï¿½ï¿½Ë»ï¿½Î¥ï¿½æ¡¢ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             ball_misbehave
             | drone_misbehave.any(-1, keepdim=True)
             | wrong_hit.any(-1, keepdim=True)
         )  # (E, 1)
-        done: torch.Tensor = truncated | terminated  # (E, 1) # ×îÖÕµÄ done ±ê¼Ç£¨½Ø¶Ï»òÖÕÖ¹£©
+        done: torch.Tensor = truncated | terminated  # (E, 1) # ï¿½ï¿½ï¿½Õµï¿½ done ï¿½ï¿½Ç£ï¿½ï¿½Ø¶Ï»ï¿½ï¿½ï¿½Ö¹ï¿½ï¿½
 
-        # log stats # ¼ÇÂ¼Í³¼ÆÊý¾Ý
-        self.stats["return"].add_(reward.mean(dim=-1, keepdim=True)) # ÀÛ¼ÓÆ½¾ù½±Àøµ½»Ø±¨
-        self.stats["episode_len"] = self.progress_buf.unsqueeze(1) # ¼ÇÂ¼µ±Ç°»ØºÏ³¤¶È
+        # log stats # ï¿½ï¿½Â¼Í³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["return"].add_(reward.mean(dim=-1, keepdim=True)) # ï¿½Û¼ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø±ï¿½
+        self.stats["episode_len"] = self.progress_buf.unsqueeze(1) # ï¿½ï¿½Â¼ï¿½ï¿½Ç°ï¿½ØºÏ³ï¿½ï¿½ï¿½
 
-        self.stats["done"].add_(done.float()) # ÀÛ¼Ó done ´ÎÊý
-        self.stats["truncated"].add_(truncated.float()) # ÀÛ¼Ó truncated (½Ø¶Ï) ´ÎÊý
-        self.stats["terminated"].add_(terminated.float()) # ÀÛ¼Ó terminated (ÖÕÖ¹) ´ÎÊý
+        self.stats["done"].add_(done.float()) # ï¿½Û¼ï¿½ done ï¿½ï¿½ï¿½ï¿½
+        self.stats["truncated"].add_(truncated.float()) # ï¿½Û¼ï¿½ truncated (ï¿½Ø¶ï¿½) ï¿½ï¿½ï¿½ï¿½
+        self.stats["terminated"].add_(terminated.float()) # ï¿½Û¼ï¿½ terminated (ï¿½ï¿½Ö¹) ï¿½ï¿½ï¿½ï¿½
 
-        self.stats["ball_misbehave"] = ball_misbehave.float() # ¼ÇÂ¼ÇòÎ¥¹æ
-        self.stats["ball_too_low"] = ball_too_low.float() # ¼ÇÂ¼Çò¹ýµÍ
-        self.stats["ball_too_high"] = ball_too_high.float() # ¼ÇÂ¼Çò¹ý¸ß
-        self.stats["ball_hit_net"] = ball_hit_net.float() # ¼ÇÂ¼Çò×²Íø
-        self.stats["ball_out_of_court"] = ball_out_of_court.float() # ¼ÇÂ¼Çò³ö½ç
+        self.stats["ball_misbehave"] = ball_misbehave.float() # ï¿½ï¿½Â¼ï¿½ï¿½Î¥ï¿½ï¿½
+        self.stats["ball_too_low"] = ball_too_low.float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["ball_too_high"] = ball_too_high.float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["ball_hit_net"] = ball_hit_net.float() # ï¿½ï¿½Â¼ï¿½ï¿½×²ï¿½ï¿½
+        self.stats["ball_out_of_court"] = ball_out_of_court.float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½
 
-        self.stats["drone_misbehave"] = drone_misbehave.any(-1, keepdim=True).float() # ¼ÇÂ¼ÎÞÈË»úÎ¥¹æ£¨ÈÎÒâÒ»¸ö£©
-        self.stats["drone0_misbehave"] = drone_misbehave[..., 0].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú0Î¥¹æ
-        self.stats["drone1_misbehave"] = drone_misbehave[..., 1].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú1Î¥¹æ
-        self.stats["drone_too_low"] = drone_too_low.any(-1, keepdim=True).float() # ¼ÇÂ¼ÎÞÈË»ú¹ýµÍ£¨ÈÎÒâÒ»¸ö£©
-        self.stats["drone0_too_low"] = drone_too_low[..., 0].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú0¹ýµÍ
-        self.stats["drone1_too_low"] = drone_too_low[..., 1].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú1¹ýµÍ
-        self.stats["drone_hit_net"] = drone_hit_net.any(-1, keepdim=True).float() # ¼ÇÂ¼ÎÞÈË»ú×²Íø£¨ÈÎÒâÒ»¸ö£©
-        self.stats["drone0_hit_net"] = drone_hit_net[..., 0].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú0×²Íø
-        self.stats["drone1_hit_net"] = drone_hit_net[..., 1].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú1×²Íø
+        self.stats["drone_misbehave"] = drone_misbehave.any(-1, keepdim=True).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½Î¥ï¿½æ£¨ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_misbehave"] = drone_misbehave[..., 0].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½0Î¥ï¿½ï¿½
+        self.stats["drone1_misbehave"] = drone_misbehave[..., 1].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½1Î¥ï¿½ï¿½
+        self.stats["drone_too_low"] = drone_too_low.any(-1, keepdim=True).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½ï¿½ï¿½ï¿½Í£ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_too_low"] = drone_too_low[..., 0].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone1_too_low"] = drone_too_low[..., 1].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone_hit_net"] = drone_hit_net.any(-1, keepdim=True).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½×²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_hit_net"] = drone_hit_net[..., 0].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½0×²ï¿½ï¿½
+        self.stats["drone1_hit_net"] = drone_hit_net[..., 1].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½1×²ï¿½ï¿½
 
-        self.stats["wrong_hit"] = wrong_hit.any(-1, keepdim=True).float() # ¼ÇÂ¼´íÎó»÷Çò£¨ÈÎÒâÒ»¸ö£©
-        self.stats["drone0_wrong_hit"] = wrong_hit[..., 0].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú0´íÎó»÷Çò
-        self.stats["drone1_wrong_hit"] = wrong_hit[..., 1].unsqueeze(-1).float() # ¼ÇÂ¼ÎÞÈË»ú1´íÎó»÷Çò
-        self.stats["wrong_hit_turn"] = wrong_hit_turn.any(-1, keepdim=True).float() # ¼ÇÂ¼´íÎó»ØºÏ»÷Çò£¨ÈÎÒâÒ»¸ö£©
-        self.stats["drone0_wrong_hit_turn"] = ( # ¼ÇÂ¼ÎÞÈË»ú0´íÎó»ØºÏ»÷Çò
+        self.stats["wrong_hit"] = wrong_hit.any(-1, keepdim=True).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_wrong_hit"] = wrong_hit[..., 0].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone1_wrong_hit"] = wrong_hit[..., 1].unsqueeze(-1).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["wrong_hit_turn"] = wrong_hit_turn.any(-1, keepdim=True).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ØºÏ»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_wrong_hit_turn"] = ( # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½ØºÏ»ï¿½ï¿½ï¿½
             wrong_hit_turn[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_wrong_hit_turn"] = ( # ¼ÇÂ¼ÎÞÈË»ú1´íÎó»ØºÏ»÷Çò
+        self.stats["drone1_wrong_hit_turn"] = ( # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½ØºÏ»ï¿½ï¿½ï¿½
             wrong_hit_turn[..., 1].unsqueeze(-1).float()
         )
-        self.stats["wrong_hit_racket"] = wrong_hit_racket.any(-1, keepdim=True).float() # ¼ÇÂ¼´íÎóÇòÅÄ»÷Çò£¨ÈÎÒâÒ»¸ö£©
-        self.stats["drone0_wrong_hit_racket"] = ( # ¼ÇÂ¼ÎÞÈË»ú0´íÎóÇòÅÄ»÷Çò
+        self.stats["wrong_hit_racket"] = wrong_hit_racket.any(-1, keepdim=True).float() # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ò»ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_wrong_hit_racket"] = ( # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½
             wrong_hit_racket[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_wrong_hit_racket"] = ( # ¼ÇÂ¼ÎÞÈË»ú1´íÎóÇòÅÄ»÷Çò
+        self.stats["drone1_wrong_hit_racket"] = ( # ï¿½ï¿½Â¼ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä»ï¿½ï¿½ï¿½
             wrong_hit_racket[..., 1].unsqueeze(-1).float()
         )
 
-        self.stats["misbehave_penalty"].add_( # ÀÛ¼ÓÆ½¾ùÎ¥¹æ³Í·£
+        self.stats["misbehave_penalty"].add_( # ï¿½Û¼ï¿½Æ½ï¿½ï¿½Î¥ï¿½ï¿½Í·ï¿½
             misbehave_penalty.mean(dim=-1, keepdim=True)
         )
-        self.stats["drone0_misbehave_penalty"].add_( # ÀÛ¼ÓÎÞÈË»ú0Î¥¹æ³Í·£
+        self.stats["drone0_misbehave_penalty"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0Î¥ï¿½ï¿½Í·ï¿½
             misbehave_penalty[..., 0].unsqueeze(-1)
         )
-        self.stats["drone1_misbehave_penalty"].add_( # ÀÛ¼ÓÎÞÈË»ú1Î¥¹æ³Í·£
+        self.stats["drone1_misbehave_penalty"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1Î¥ï¿½ï¿½Í·ï¿½
             misbehave_penalty[..., 1].unsqueeze(-1)
         )
-        self.stats["penalty_ball_misbehave"].add_(penalty_ball_misbehave) # ÀÛ¼ÓÇòÎ¥¹æ³Í·£
-        self.stats["penalty_drone_misbehave"].add_( # ÀÛ¼ÓÆ½¾ùÎÞÈË»úÎ¥¹æ³Í·£
+        self.stats["penalty_ball_misbehave"].add_(penalty_ball_misbehave) # ï¿½Û¼ï¿½ï¿½ï¿½Î¥ï¿½ï¿½Í·ï¿½
+        self.stats["penalty_drone_misbehave"].add_( # ï¿½Û¼ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½Î¥ï¿½ï¿½Í·ï¿½
             penalty_drone_misbehave.mean(dim=-1, keepdim=True)
         )
-        self.stats["drone0_penalty_drone_misbehave"].add_( # ÀÛ¼ÓÎÞÈË»ú0Î¥¹æ³Í·£
+        self.stats["drone0_penalty_drone_misbehave"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0Î¥ï¿½ï¿½Í·ï¿½
             penalty_drone_misbehave[..., 0].unsqueeze(-1)
         )
-        self.stats["drone1_penalty_drone_misbehave"].add_( # ÀÛ¼ÓÎÞÈË»ú1Î¥¹æ³Í·£
+        self.stats["drone1_penalty_drone_misbehave"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1Î¥ï¿½ï¿½Í·ï¿½
             penalty_drone_misbehave[..., 1].unsqueeze(-1)
         )
-        self.stats["penalty_wrong_hit"].add_( # ÀÛ¼ÓÆ½¾ù´íÎó»÷Çò³Í·£
+        self.stats["penalty_wrong_hit"].add_( # ï¿½Û¼ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í·ï¿½
             penalty_wrong_hit.mean(dim=-1, keepdim=True)
         )
-        self.stats["drone0_penalty_wrong_hit"].add_( # ÀÛ¼ÓÎÞÈË»ú0´íÎó»÷Çò³Í·£
+        self.stats["drone0_penalty_wrong_hit"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í·ï¿½
             penalty_wrong_hit[..., 0].unsqueeze(-1)
         )
-        self.stats["drone1_penalty_wrong_hit"].add_( # ÀÛ¼ÓÎÞÈË»ú1´íÎó»÷Çò³Í·£
+        self.stats["drone1_penalty_wrong_hit"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í·ï¿½
             penalty_wrong_hit[..., 1].unsqueeze(-1)
         )
 
-        self.stats["task_reward"].add_(task_reward) # ÀÛ¼ÓÈÎÎñ½±Àø
-        self.stats["reward_success_hit"].add_(reward_success_hit) # ÀÛ¼Ó³É¹¦»÷Çò½±Àø
-        self.stats["reward_success_cross"].add_(reward_success_cross) # ÀÛ¼Ó³É¹¦¹ýÍø½±Àø
-        self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor) # ÀÛ¼ÓÃªµã¾àÀë³Í·£
-        self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True)) # ÀÛ¼Ó¶¯×÷Æ½»¬¶È½±Àø
-        self.stats["penalty_yaw"].add_(penalty_yaw.mean(dim=-1, keepdim=True)) # ÀÛ¼Ó¶¯×÷Æ½»¬¶È½±Àø
+        self.stats["task_reward"].add_(task_reward) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["reward_success_hit"].add_(reward_success_hit) # ï¿½Û¼Ó³É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["reward_success_cross"].add_(reward_success_cross) # ï¿½Û¼Ó³É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["reward_upward_ball_vel"].add_(reward_upward_ball_vel) # ï¿½Û¼Ó»ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ù¶È½ï¿½ï¿½ï¿½
+        self.stats["reward_catch_height"].add_(reward_catch_height) # ï¿½Û¼Ó½ï¿½ï¿½ï¿½ï¿½ß¶È½ï¿½ï¿½ï¿½
+        self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor) # ï¿½Û¼ï¿½Ãªï¿½ï¿½ï¿½ï¿½ï¿½Í·ï¿½
+        self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True)) # ï¿½Û¼Ó¶ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½È½ï¿½ï¿½ï¿½
+        self.stats["penalty_yaw"].add_(penalty_yaw.mean(dim=-1, keepdim=True)) # ï¿½Û¼Ó¶ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½È½ï¿½ï¿½ï¿½
+        self.stats["penalty_roll"].add_(penalty_roll.mean(dim=-1, keepdim=True)) # ï¿½Û¼Ó¶ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½È½ï¿½ï¿½ï¿½
 
 
-        if self.reward_shaping: # Èç¹ûÆôÓÃÁË½±ÀøËÜÐÎ
-            self.stats["shaping_reward"].add_(shaping_reward.mean(dim=-1, keepdim=True)) # ÀÛ¼ÓÆ½¾ùËÜÐÎ½±Àø
-            self.stats["drone0_shaping_reward"].add_( # ÀÛ¼ÓÎÞÈË»ú0ËÜÐÎ½±Àø
+        if self.reward_shaping: # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+            self.stats["shaping_reward"].add_(shaping_reward.mean(dim=-1, keepdim=True)) # ï¿½Û¼ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½Î½ï¿½ï¿½ï¿½
+            self.stats["drone0_shaping_reward"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½Î½ï¿½ï¿½ï¿½
                 shaping_reward[..., 0].unsqueeze(-1)
             )
-            self.stats["drone1_shaping_reward"].add_( # ÀÛ¼ÓÎÞÈË»ú1ËÜÐÎ½±Àø
+            self.stats["drone1_shaping_reward"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½Î½ï¿½ï¿½ï¿½
                 shaping_reward[..., 1].unsqueeze(-1)
             )
-            self.stats["reward_hit_direction"].add_( # ÀÛ¼ÓÆ½¾ù»÷Çò·½Ïò½±Àø
+            self.stats["reward_hit_direction"].add_( # ï¿½Û¼ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 reward_hit_direction.mean(dim=-1, keepdim=True)
             )
-            self.stats["drone0_reward_hit_direction"].add_( # ÀÛ¼ÓÎÞÈË»ú0»÷Çò·½Ïò½±Àø
+            self.stats["drone0_reward_hit_direction"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 reward_hit_direction[..., 0].unsqueeze(-1)
             )
-            self.stats["drone1_reward_hit_direction"].add_( # ÀÛ¼ÓÎÞÈË»ú1»÷Çò·½Ïò½±Àø
+            self.stats["drone1_reward_hit_direction"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 reward_hit_direction[..., 1].unsqueeze(-1)
             )
-            self.stats["reward_dist_to_ball"].add_(reward_dist_to_ball) # ÀÛ¼Óµ½Çò¾àÀë½±Àø
-            self.stats["reward_drone0_dist_to_ball"].add_(reward_drone_dist_to_ball[..., 0].unsqueeze(-1)) # ÀÛ¼Óµ½Çò¾àÀë½±Àø
-            self.stats["reward_drone1_dist_to_ball"].add_(reward_drone_dist_to_ball[..., 1].unsqueeze(-1)) # ÀÛ¼Óµ½Çò¾àÀë½±Àø
+            self.stats["reward_dist_to_ball"].add_(reward_dist_to_ball) # ï¿½Û¼Óµï¿½ï¿½ï¿½ï¿½ï¿½ë½±ï¿½ï¿½
+            self.stats["reward_drone0_dist_to_ball"].add_(reward_drone_dist_to_ball[..., 0].unsqueeze(-1)) # ï¿½Û¼Óµï¿½ï¿½ï¿½ï¿½ï¿½ë½±ï¿½ï¿½
+            self.stats["reward_drone1_dist_to_ball"].add_(reward_drone_dist_to_ball[..., 1].unsqueeze(-1)) # ï¿½Û¼Óµï¿½ï¿½ï¿½ï¿½ï¿½ë½±ï¿½ï¿½
 
 
-        self.stats["num_sim_hits"].add_(sim_hit.any(-1, keepdim=True).float()) # ÀÛ¼ÓÄ£Äâ»÷Çò´ÎÊý
-        self.stats["drone0_num_sim_hits"].add_(sim_hit[..., 0].unsqueeze(-1).float()) # ÀÛ¼ÓÎÞÈË»ú0Ä£Äâ»÷Çò´ÎÊý
-        self.stats["drone1_num_sim_hits"].add_(sim_hit[..., 1].unsqueeze(-1).float()) # ÀÛ¼ÓÎÞÈË»ú1Ä£Äâ»÷Çò´ÎÊý
-        self.stats["num_true_hits"].add_(true_hit.any(-1, keepdim=True).float()) # ÀÛ¼ÓÕæÊµ»÷Çò´ÎÊý
-        self.stats["drone0_num_true_hits"].add_(true_hit[..., 0].unsqueeze(-1).float()) # ÀÛ¼ÓÎÞÈË»ú0ÕæÊµ»÷Çò´ÎÊý
-        self.stats["drone1_num_true_hits"].add_(true_hit[..., 1].unsqueeze(-1).float()) # ÀÛ¼ÓÎÞÈË»ú1ÕæÊµ»÷Çò´ÎÊý
-        self.stats["num_success_hits"].add_(success_hit.any(-1, keepdim=True).float()) # ÀÛ¼Ó³É¹¦»÷Çò´ÎÊý
-        self.stats["drone0_num_success_hits"].add_( # ÀÛ¼ÓÎÞÈË»ú0³É¹¦»÷Çò´ÎÊý
+        self.stats["num_sim_hits"].add_(sim_hit.any(-1, keepdim=True).float()) # ï¿½Û¼ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_num_sim_hits"].add_(sim_hit[..., 0].unsqueeze(-1).float()) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone1_num_sim_hits"].add_(sim_hit[..., 1].unsqueeze(-1).float()) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["num_true_hits"].add_(true_hit.any(-1, keepdim=True).float()) # ï¿½Û¼ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_num_true_hits"].add_(true_hit[..., 0].unsqueeze(-1).float()) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone1_num_true_hits"].add_(true_hit[..., 1].unsqueeze(-1).float()) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["num_success_hits"].add_(success_hit.any(-1, keepdim=True).float()) # ï¿½Û¼Ó³É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_num_success_hits"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             success_hit[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_num_success_hits"].add_( # ÀÛ¼ÓÎÞÈË»ú1³É¹¦»÷Çò´ÎÊý
+        self.stats["drone1_num_success_hits"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             success_hit[..., 1].unsqueeze(-1).float()
         )
-        self.stats["wrong_hit_sim"].add_(wrong_hit_sim.any(-1, keepdim=True).float()) # ÀÛ¼Ó´íÎóÄ£Äâ»÷Çò´ÎÊý£¨Á¬Ðø»÷Çò£©
-        self.stats["drone0_wrong_hit_sim"].add_( # ÀÛ¼ÓÎÞÈË»ú0´íÎóÄ£Äâ»÷Çò´ÎÊý
+        self.stats["wrong_hit_sim"].add_(wrong_hit_sim.any(-1, keepdim=True).float()) # ï¿½Û¼Ó´ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["drone0_wrong_hit_sim"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             wrong_hit_sim[..., 0].unsqueeze(-1).float()
         )
-        self.stats["drone1_wrong_hit_sim"].add_( # ÀÛ¼ÓÎÞÈË»ú1´íÎóÄ£Äâ»÷Çò´ÎÊý
+        self.stats["drone1_wrong_hit_sim"].add_( # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             wrong_hit_sim[..., 1].unsqueeze(-1).float()
         )
 
-        self.stats["num_ball_cross"].add_(ball_cross.float()) # ÀÛ¼ÓÇò¹ýÍø´ÎÊý
-        self.stats["num_true_cross"].add_(true_cross.float()) # ÀÛ¼ÓÇòÕæÊµ¹ýÍø´ÎÊý
-        self.stats["num_success_cross"].add_(success_cross.float()) # ÀÛ¼ÓÇò³É¹¦¹ýÍø´ÎÊý
-        if success_cross.any(): # Èç¹ûÓÐ³É¹¦¹ýÍø
-            self.update_mean_stats( # ¸üÐÂÆ½¾ù¹ýÍø¸ß¶È
+        self.stats["num_ball_cross"].add_(ball_cross.float()) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["num_true_cross"].add_(true_cross.float()) # ï¿½Û¼ï¿½ï¿½ï¿½ï¿½ï¿½Êµï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        self.stats["num_success_cross"].add_(success_cross.float()) # ï¿½Û¼ï¿½ï¿½ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        if success_cross.any(): # ï¿½ï¿½ï¿½ï¿½Ð³É¹ï¿½ï¿½ï¿½ï¿½ï¿½
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ß¶ï¿½
                 "cross_height",
                 self.ball_pos[..., 2],
                 "num_success_cross",
                 success_cross,
             )
 
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0µÄÆ½¾ùx×ø±ê
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½Æ½ï¿½ï¿½xï¿½ï¿½ï¿½ï¿½
             "drone0_x", self.drone.pos[:, 0, 0].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0µÄÆ½¾ùy×ø±ê
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½Æ½ï¿½ï¿½yï¿½ï¿½ï¿½ï¿½
             "drone0_y", self.drone.pos[:, 0, 1].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0µÄÆ½¾ùz×ø±ê
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½Æ½ï¿½ï¿½zï¿½ï¿½ï¿½ï¿½
             "drone0_z", self.drone.pos[:, 0, 2].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0µ½ÃªµãµÄÆ½¾ù¾àÀë
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½ï¿½Ãªï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             "drone0_dist_to_anchor", dist_to_anchor[:, 0].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1µÄÆ½¾ùx×ø±ê
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½Æ½ï¿½ï¿½xï¿½ï¿½ï¿½ï¿½
             "drone1_x", self.drone.pos[:, 1, 0].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1µÄÆ½¾ùy×ø±ê
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½Æ½ï¿½ï¿½yï¿½ï¿½ï¿½ï¿½
             "drone1_y", self.drone.pos[:, 1, 1].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1µÄÆ½¾ùz×ø±ê
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½Æ½ï¿½ï¿½zï¿½ï¿½ï¿½ï¿½
             "drone1_z", self.drone.pos[:, 1, 2].unsqueeze(-1), "episode_len"
         )
-        self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1µ½ÃªµãµÄÆ½¾ù¾àÀë
+        self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½ï¿½Ãªï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
             "drone1_dist_to_anchor", dist_to_anchor[:, 1].unsqueeze(-1), "episode_len"
         )
 
-        if success_hit[..., 0].any(): # Èç¹ûÎÞÈË»ú0³É¹¦»÷Çò
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0³É¹¦»÷ÇòÊ±µÄÆ½¾ùx×ø±ê
+        if success_hit[..., 0].any(): # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Æ½ï¿½ï¿½xï¿½ï¿½ï¿½ï¿½
                 "drone0_hit_x",
                 self.drone.pos[:, 0, 0].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0³É¹¦»÷ÇòÊ±µÄÆ½¾ùy×ø±ê
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Æ½ï¿½ï¿½yï¿½ï¿½ï¿½ï¿½
                 "drone0_hit_y",
                 self.drone.pos[:, 0, 1].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0³É¹¦»÷ÇòÊ±µÄÆ½¾ùz×ø±ê
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Æ½ï¿½ï¿½zï¿½ï¿½ï¿½ï¿½
                 "drone0_hit_z",
                 self.drone.pos[:, 0, 2].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú0³É¹¦»÷ÇòÊ±µ½ÃªµãµÄÆ½¾ù¾àÀë
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½0ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Ãªï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 "drone0_hit_dist_to_anchor",
                 dist_to_anchor[:, 0].unsqueeze(-1),
                 "drone0_num_success_hits",
                 success_hit[..., 0].unsqueeze(-1),
             )
-        if success_hit[..., 1].any(): # Èç¹ûÎÞÈË»ú1³É¹¦»÷Çò
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1³É¹¦»÷ÇòÊ±µÄÆ½¾ùx×ø±ê
+        if success_hit[..., 1].any(): # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Æ½ï¿½ï¿½xï¿½ï¿½ï¿½ï¿½
                 "drone1_hit_x",
                 self.drone.pos[:, 1, 0].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1³É¹¦»÷ÇòÊ±µÄÆ½¾ùy×ø±ê
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Æ½ï¿½ï¿½yï¿½ï¿½ï¿½ï¿½
                 "drone1_hit_y",
                 self.drone.pos[:, 1, 1].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1³É¹¦»÷ÇòÊ±µÄÆ½¾ùz×ø±ê
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Æ½ï¿½ï¿½zï¿½ï¿½ï¿½ï¿½
                 "drone1_hit_z",
                 self.drone.pos[:, 1, 2].unsqueeze(-1),
                 "drone1_num_success_hits",
                 success_hit[..., 1].unsqueeze(-1),
             )
-            self.update_mean_stats( # ¸üÐÂÎÞÈË»ú1³É¹¦»÷ÇòÊ±µ½ÃªµãµÄÆ½¾ù¾àÀë
+            self.update_mean_stats( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ë»ï¿½1ï¿½É¹ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½Ãªï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
                 "drone1_hit_dist_to_anchor",
                 dist_to_anchor[:, 0].unsqueeze(-1),
                 "drone1_num_success_hits",
@@ -1293,39 +1351,39 @@ class MultiJuggleVolleyball(IsaacEnv):
             )
             
 
-        # ÕâÀïµÄÂß¼­ÊÇ£ºÔÚ»ØºÏ½áÊøÊ±£¨done=True£©£¬½«ÀÛ¼ÓµÄÍ³¼ÆÁ¿£¨Èçv, a, jerk£©×ª»»ÎªÆ½¾ùÖµ
-        ep_len = self.progress_buf.unsqueeze(-1) # »ñÈ¡µ±Ç°»ØºÏ³¤¶È
-        self.stats['action_error_order1_mean'].div_( # ¼ÆËã¶¯×÷Îó²îµÄÆ½¾ùÖµ£¨³ýÒÔ»ØºÏ³¤¶È£©
-            torch.where(done, ep_len, torch.ones_like(ep_len)) # ½öÔÚdoneÊ±³ýÒÔep_len£¬·ñÔò³ýÒÔ1
+        # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ß¼ï¿½ï¿½Ç£ï¿½ï¿½Ú»ØºÏ½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½done=Trueï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Û¼Óµï¿½Í³ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½v, a, jerkï¿½ï¿½×ªï¿½ï¿½ÎªÆ½ï¿½ï¿½Öµ
+        ep_len = self.progress_buf.unsqueeze(-1) # ï¿½ï¿½È¡ï¿½ï¿½Ç°ï¿½ØºÏ³ï¿½ï¿½ï¿½
+        self.stats['action_error_order1_mean'].div_( # ï¿½ï¿½ï¿½ã¶¯ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½Öµï¿½ï¿½ï¿½ï¿½ï¿½Ô»ØºÏ³ï¿½ï¿½È£ï¿½
+            torch.where(done, ep_len, torch.ones_like(ep_len)) # ï¿½ï¿½ï¿½ï¿½doneÊ±ï¿½ï¿½ï¿½ï¿½ep_lenï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½1
         )
-        self.stats['smoothness_mean'].div_( # ¼ÆËãÆ½»¬¶ÈµÄÆ½¾ùÖµ
+        self.stats['smoothness_mean'].div_( # ï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½ï¿½Èµï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
-        self.stats["linear_v_mean"].div_( # ¼ÆËãÏßËÙ¶ÈµÄÆ½¾ùÖµ
+        self.stats["linear_v_mean"].div_( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ù¶Èµï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
-        self.stats["angular_v_mean"].div_( # ¼ÆËã½ÇËÙ¶ÈµÄÆ½¾ùÖµ
+        self.stats["angular_v_mean"].div_( # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ù¶Èµï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
-        self.stats["linear_a_mean"].div_( # ¼ÆËãÏß¼ÓËÙ¶ÈµÄÆ½¾ùÖµ
+        self.stats["linear_a_mean"].div_( # ï¿½ï¿½ï¿½ï¿½ï¿½ß¼ï¿½ï¿½Ù¶Èµï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
-        self.stats["angular_a_mean"].div_( # ¼ÆËã½Ç¼ÓËÙ¶ÈµÄÆ½¾ùÖµ
+        self.stats["angular_a_mean"].div_( # ï¿½ï¿½ï¿½ï¿½Ç¼ï¿½ï¿½Ù¶Èµï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
-        self.stats["linear_jerk_mean"].div_( # ¼ÆËãÏß¼Ó¼ÓËÙ¶È£¨jerk£©µÄÆ½¾ùÖµ
+        self.stats["linear_jerk_mean"].div_( # ï¿½ï¿½ï¿½ï¿½ï¿½ß¼Ó¼ï¿½ï¿½Ù¶È£ï¿½jerkï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
-        self.stats["angular_jerk_mean"].div_(  # ¼ÆËã½Ç¼Ó¼ÓËÙ¶È£¨jerk£©µÄÆ½¾ùÖµ
+        self.stats["angular_jerk_mean"].div_(  # ï¿½ï¿½ï¿½ï¿½Ç¼Ó¼ï¿½ï¿½Ù¶È£ï¿½jerkï¿½ï¿½ï¿½ï¿½Æ½ï¿½ï¿½Öµ
             torch.where(done, ep_len, torch.ones_like(ep_len))
         )
 
-        return TensorDict( # ·µ»Ø°üº¬½±ÀøºÍdoneÐÅÏ¢µÄTensorDict
+        return TensorDict( # ï¿½ï¿½ï¿½Ø°ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½doneï¿½ï¿½Ï¢ï¿½ï¿½TensorDict
             {
-                "agents": {"reward": reward.unsqueeze(-1)}, # ½±Àø£¨(E, 2, 1)£©
-                "done": done, # done ±ê¼Ç (E, 1)
-                "terminated": terminated, # ÖÕÖ¹±ê¼Ç (E, 1)
-                "truncated": truncated, # ½Ø¶Ï±ê¼Ç (E, 1)
+                "agents": {"reward": reward.unsqueeze(-1)}, # ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½(E, 2, 1)ï¿½ï¿½
+                "done": done, # done ï¿½ï¿½ï¿½ (E, 1)
+                "terminated": terminated, # ï¿½ï¿½Ö¹ï¿½ï¿½ï¿½ (E, 1)
+                "truncated": truncated, # ï¿½Ø¶Ï±ï¿½ï¿½ (E, 1)
             },
-            self.num_envs, # Åú´Î´óÐ¡ (E)
+            self.num_envs, # ï¿½ï¿½ï¿½Î´ï¿½Ð¡ (E)
         )
