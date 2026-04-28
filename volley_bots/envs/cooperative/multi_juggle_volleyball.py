@@ -272,6 +272,9 @@ class MultiJuggleVolleyball(IsaacEnv):
             torch.tensor(cfg.task.init_drone_pos_dist.high, device=self.device)
             + self.anchor,
         )
+        self.ball_anchor = self.anchor.clone()
+        self.ball_anchor[..., 2] = 1.5
+        
         self.init_drone_rpy_dist = D.Uniform(
             torch.tensor([-0.1, -0.1, 0.3], device=self.device) * torch.pi,
             torch.tensor([0.1, 0.1, -0.3], device=self.device) * torch.pi,
@@ -1039,7 +1042,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.ball_last_vel = self.ball_linear_vel.clone()
 
         # misbehave penalty # 违规行为惩罚
-        _misbehave_penalty_coeff = 10.0 # 违规惩罚系数
+        _misbehave_penalty_coeff = 5.0 # 违规惩罚系数
         penalty_ball_misbehave = ( # 球违规的惩罚（全局共享，稀疏）
             _misbehave_penalty_coeff * ball_misbehave
         )  # share, sparse, (E, 1)
@@ -1055,19 +1058,20 @@ class MultiJuggleVolleyball(IsaacEnv):
         )  # (E, 2)
 
         # task reward # 任务奖励
-        _task_reward_coeff = 20.0  # 1.0,10.0 # 基础任务奖励系数
-        reward_success_hit = _task_reward_coeff * success_hit.any( # 成功击球奖励（全局共享，稀疏）
+        _task_reward_coeff = 10.0  # 1.0,10.0 # 基础任务奖励系数
+        reward_success_hit = 2 * _task_reward_coeff * success_hit.any( # 成功击球奖励（全局共享，稀疏）
             -1, keepdim=True
         )  # share, sparse, (E, 1)
         reward_success_cross = ( # 成功过网奖励（全局共享，稀疏）
             _task_reward_coeff * true_cross.float() * cross_height_score
         )  # share, sparse, (E, 1)
-        _upward_ball_vel_reward_coeff = 5.0
+        _upward_ball_vel_reward_coeff = 10.0
         reward_upward_ball_vel = (
             _upward_ball_vel_reward_coeff
             * (
                 success_hit.any(-1, keepdim=True)
-                & (self.ball_linear_vel[..., 2] > 3.0)
+                & (self.ball_linear_vel[..., 2] > 5.0)
+                & (self.ball_linear_vel[..., 1].abs() > 5.0)
             ).float()
         )  # share, sparse, (E, 1)
 
@@ -1128,14 +1132,14 @@ class MultiJuggleVolleyball(IsaacEnv):
         racket_center = self.get_racket_center()  # (E, 2, 3)
         dist_to_ball = torch.norm(racket_center - self.ball_pos, p=2, dim=-1)  # (E, 2)
         reward_dist_to_ball = ( # 靠近球的距离奖励
-            _dist_coeff * current_turn_mask / (1 + dist_to_ball) # 仅给予当前回合的无人机靠近球的奖励
+            0.1 * _dist_coeff * current_turn_mask / (1 + dist_to_ball) # 仅给予当前回合的无人机靠近球的奖励
         )  # individual, dense, (E, 2)
         reward_drone_dist_to_ball = reward_dist_to_ball.clone()
         reward_dist_to_ball = reward_dist_to_ball.sum( # 对当前回合无人机的距离奖励求和
             -1, keepdim=True
         ) / current_turn_mask.sum(-1, keepdim=True).clamp(min=1.0)  # share, dense, (E, 1)
 
-        ball_dist_to_anchor = torch.norm(self.ball_pos - self.anchor, p=2, dim=-1)  # (E, 2)
+        ball_dist_to_anchor = torch.norm(self.ball_pos - self.ball_anchor, p=2, dim=-1)  # (E, 2)
         reward_ball_to_anchor = (
             _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
         )  # individual, dense, (E, 2)
