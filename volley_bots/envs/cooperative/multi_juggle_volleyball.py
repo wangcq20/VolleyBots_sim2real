@@ -273,7 +273,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             + self.anchor,
         )
         self.ball_anchor = self.anchor.clone()
-        self.ball_anchor[..., 2] = 1.5
+        self.ball_anchor[..., 2] = 1.6
         
         self.init_drone_rpy_dist = D.Uniform(
             torch.tensor([-0.1, -0.1, 0.3], device=self.device) * torch.pi,
@@ -762,7 +762,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.racket_near_ball[env_ids] = False
         self.drone_near_ball[env_ids] = False
 
-        self.KD[env_ids] = 0.08
+        self.KD[env_ids] = 0.13
         # draw
         if (env_ids == self.central_env_idx).any() and self._should_render(0):
             self.ball_traj_vis.clear()
@@ -1021,7 +1021,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         )  # (E, 1)
         cross_peak_height = self.ball_peak_height.clone()
         cross_height_score = (
-            (cross_peak_height - (self.min_height - 0.3)) / 0.3
+            (cross_peak_height - (self.min_height - 0.2)) / 0.2
         ).clamp(min=0.0, max=1.0)
         cross_height_score = torch.where(
             cross_peak_height > self.min_height + 0.5,
@@ -1070,13 +1070,13 @@ class MultiJuggleVolleyball(IsaacEnv):
             _upward_ball_vel_reward_coeff
             * (
                 success_hit.any(-1, keepdim=True)
-                & (self.ball_linear_vel[..., 2] > 5.0)
-                & (self.ball_linear_vel[..., 1].abs() > 5.0)
+                & (self.ball_linear_vel[..., 2] > 4.0)
+                & (self.ball_linear_vel[..., 1].abs() > 4.0)
             ).float()
         )  # share, sparse, (E, 1)
 
         _catch_height_reward_coeff = 5.0
-        _catch_height_target = 1.5
+        _catch_height_target = 1.6
         _catch_height_tolerance = 0.2
         catch_height_score = (
             1.0
@@ -1141,7 +1141,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         ball_dist_to_anchor = torch.norm(self.ball_pos - self.ball_anchor, p=2, dim=-1)  # (E, 2)
         reward_ball_to_anchor = (
-            _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
+            0.1 * _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
         )  # individual, dense, (E, 2)
         reward_drone_ball_to_anchor = reward_ball_to_anchor.clone()
         reward_ball_to_anchor = reward_ball_to_anchor.sum(
