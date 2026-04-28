@@ -297,6 +297,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.id[:, 1, 1] = 1
         
         self.ball_last_vel = torch.zeros((self.num_envs, 1, 3), device=self.device)
+        self.ball_peak_height = torch.zeros((self.num_envs, 1), device=self.device)
         self.last_linear_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
         self.last_angular_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
         self.last_linear_a = torch.zeros(self.num_envs, self.num_drones, device=self.device)
@@ -488,6 +489,7 @@ class MultiJuggleVolleyball(IsaacEnv):
                 "reward_upward_ball_vel": UnboundedContinuousTensorSpec(1),
                 "reward_catch_height": UnboundedContinuousTensorSpec(1),
                 "penalty_dist_to_anchor": UnboundedContinuousTensorSpec(1),
+                "penalty_drone_too_close": UnboundedContinuousTensorSpec(1),
                 "penalty_yaw": UnboundedContinuousTensorSpec(1),
                 "penalty_roll": UnboundedContinuousTensorSpec(1),
 
@@ -733,6 +735,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         # env stats
         self.last_hit_step[env_ids] = -100.0
         self.last_cross_step[env_ids] = -100.0
+        self.ball_peak_height[env_ids] = ball_pos[..., 2].unsqueeze(-1)
         self.stats[env_ids] = 0.0
         
 
@@ -953,7 +956,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         # ball misbehave # ������Υ����Ϊ
         ball_too_low = self.ball_pos[..., 2] < 2 * self.ball_radius  # (E, 1) # ������Ƿ���ͣ�����������뾶��
         ball_too_high = self.ball_pos[..., 2] > 3.2  # (E, 1) # ������Ƿ���ߣ�����16�ף�\
-        ball_too_fast = self.ball_linear_vel[..., 1].abs() > 6.0  # (E, 1) # ������Ƿ���ߣ�����16�ף�
+        ball_too_fast = self.ball_linear_vel[..., 1] > 5.0  # (E, 1) # ������Ƿ���ߣ�����16�ף�
         ball_hit_net = self.check_hit_net(self.ball_pos, self.ball_radius)  # (E, 1) # ������Ƿ�ײ��
         ball_out_of_court = self.check_out_of_court(self.ball_pos)  # (E, 1) # ������Ƿ����
         ball_misbehave = ( # ���Υ����Ϊ�����͡����ߡ�ײ��������������һ�
@@ -963,8 +966,10 @@ class MultiJuggleVolleyball(IsaacEnv):
         # drone misbehave # ������˻���Υ����Ϊ
         drone_too_low = self.drone.pos[..., 2] < 2 * self.racket_radius
         drone_too_high = self.drone.pos[..., 2] > 2.5
+        drone_too_far_y = (self.drone.pos[..., 1] - self.anchor[..., 1]).abs() > 0.8
+        drone_too_far_x = (self.drone.pos[..., 0] - self.anchor[..., 0]).abs() > 0.8
         drone_hit_net = self.check_hit_net(self.drone.pos, self.racket_radius)  # (E, 2) # ������˻��Ƿ�ײ��
-        drone_misbehave = drone_too_low | drone_too_high | drone_hit_net  # (E, 2) # ���˻���Υ����Ϊ�����ͻ�ײ����
+        drone_misbehave = drone_too_low | drone_too_high | drone_too_far_y | drone_too_far_x | drone_hit_net  # (E, 2) # ���˻���Υ����Ϊ�����ͻ�ײ����
 
         # drone hit ball # ������˻�����
         # ball_contact_forces = self.contact_sensor.data.net_forces_w  # (E, 1, 3) # ��ȡ��ĽӴ�������������ϵ��
@@ -1000,13 +1005,24 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.turn = (self.turn + true_hit.any(dim=-1, keepdim=True)) % 2 # ����гɹ��������л��غϣ�0��1��1��0��
 
         # ball cross middle # ������Ƿ����
+        self.ball_peak_height = torch.maximum(
+            self.ball_peak_height, self.ball_pos[..., 2]
+        )
         true_cross_step_gap = 3 # �������Ρ���ʵ������֮�����Сʱ�䲽���
         ball_cross = self.ball_pos[..., 1].abs() <= self.ball_radius  # (E, 1) # ������Ƿ���������y=0��������һ����뾶�ڣ�
         true_cross = ball_cross & ( # ����ʵ������= ������������ ���� �����ϴι���ʱ�� > ���
             self.progress_buf.unsqueeze(-1) - self.last_cross_step > true_cross_step_gap
         )  # (E, 1)
-        above_min_height = self.ball_pos[..., 2] > self.min_height  # (E, 1) # �����ĸ߶��Ƿ����Ҫ�����С�߶�
-        success_cross = true_cross & above_min_height  # (E, 1) # ���ɹ�������= ��ʵ���� ���� ������С�߶�
+        cross_peak_height = self.ball_peak_height.clone()
+        cross_height_score = (
+            (cross_peak_height - (self.min_height - 0.3)) / 0.3
+        ).clamp(min=0.0, max=1.0)
+        cross_height_score = torch.where(
+            cross_peak_height > self.min_height + 0.5,
+            torch.zeros_like(cross_height_score),
+            cross_height_score,
+        )
+        success_cross = true_cross & (cross_height_score > 0.0)  # (E, 1) # ���ɹ�������= ��ʵ���� ���� �����߶ȷ�����
         self.last_cross_step[ball_cross] = self.progress_buf[ball_cross.squeeze(-1)] # ���·�����������Ļ����ġ�������ʱ�䡱
 
         if self._should_render(0): # �����Ҫ��Ⱦ��ͨ�������Ļ�����
@@ -1041,14 +1057,14 @@ class MultiJuggleVolleyball(IsaacEnv):
             -1, keepdim=True
         )  # share, sparse, (E, 1)
         reward_success_cross = ( # �ɹ������Ľ�����������ϡ�裩
-            _task_reward_coeff * success_cross
+            _task_reward_coeff * true_cross.float() * cross_height_score
         )  # share, sparse, (E, 1)
         _upward_ball_vel_reward_coeff = 5.0
         reward_upward_ball_vel = (
             _upward_ball_vel_reward_coeff
             * (
                 success_hit.any(-1, keepdim=True)
-                & (self.ball_linear_vel[..., 2] > 2.0)
+                & (self.ball_linear_vel[..., 2] > 4.0)
             ).float()
         )  # share, sparse, (E, 1)
 
@@ -1060,9 +1076,19 @@ class MultiJuggleVolleyball(IsaacEnv):
             - (self.drone.pos[..., 2] - _catch_height_target).abs()
             / _catch_height_tolerance
         ).clamp(min=0.0, max=1.0)  # (E, 2)
+        catch_anchor_xy_dist = torch.norm(
+            self.drone.pos[..., :2] - self.anchor[..., :2], p=2, dim=-1
+        )  # (E, 2)
+        catch_anchor_xy_score = (
+            1.0 - catch_anchor_xy_dist / self.anchor_radius
+        ).clamp(min=0.0, max=1.0)  # (E, 2)
         reward_catch_height = (
             _catch_height_reward_coeff
-            * (success_hit.float() * catch_height_score).sum(-1, keepdim=True)
+            * (
+                success_hit.float()
+                * catch_height_score
+                * catch_anchor_xy_score
+            ).sum(-1, keepdim=True)
             / success_hit.float().sum(-1, keepdim=True).clamp(min=1.0)
         )  # share, sparse, (E, 1)
 
@@ -1077,12 +1103,22 @@ class MultiJuggleVolleyball(IsaacEnv):
             -1, keepdim=True
         ) / return_to_anchor_mask.sum(-1, keepdim=True).clamp(min=1.0)  # share, sparse, (E, 1)
 
+        _penalty_drone_too_close_coeff = 10.0
+        _min_drone_dist = 3.0
+        drone_dist = torch.norm(
+            self.drone.pos[:, 0] - self.drone.pos[:, 1], p=2, dim=-1, keepdim=True
+        )  # (E, 1)
+        penalty_drone_too_close = _penalty_drone_too_close_coeff * (
+            _min_drone_dist - drone_dist
+        ).clamp(min=0.0)  # share, dense, (E, 1)
+
         task_reward = (
             reward_success_hit
             + reward_success_cross
             + reward_upward_ball_vel
             + reward_catch_height
             - penalty_dist_to_anchor
+            - penalty_drone_too_close
         ) # �ܵ�������
 
         # shaping reward # �������ν���
@@ -1215,6 +1251,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.stats["reward_upward_ball_vel"].add_(reward_upward_ball_vel) # �ۼӻ�������ٶȽ���
         self.stats["reward_catch_height"].add_(reward_catch_height) # �ۼӽ����߶Ƚ���
         self.stats["penalty_dist_to_anchor"].add_(penalty_dist_to_anchor) # �ۼ�ê�����ͷ�
+        self.stats["penalty_drone_too_close"].add_(penalty_drone_too_close) # �ۼ����˻������ͷ�
         self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True)) # �ۼӶ���ƽ���Ƚ���
         self.stats["penalty_yaw"].add_(penalty_yaw.mean(dim=-1, keepdim=True)) # �ۼӶ���ƽ���Ƚ���
         self.stats["penalty_roll"].add_(penalty_roll.mean(dim=-1, keepdim=True)) # �ۼӶ���ƽ���Ƚ���
@@ -1269,10 +1306,14 @@ class MultiJuggleVolleyball(IsaacEnv):
         if success_cross.any(): # ����гɹ�����
             self.update_mean_stats( # ����ƽ�������߶�
                 "cross_height",
-                self.ball_pos[..., 2],
+                cross_peak_height,
                 "num_success_cross",
                 success_cross,
             )
+
+        self.ball_peak_height = torch.where(
+            true_cross, self.ball_pos[..., 2], self.ball_peak_height
+        )
 
         self.update_mean_stats( # �������˻�0��ƽ��x����
             "drone0_x", self.drone.pos[:, 0, 0].unsqueeze(-1), "episode_len"
