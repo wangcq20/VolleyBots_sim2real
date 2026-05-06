@@ -273,7 +273,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             + self.anchor,
         )
         self.ball_anchor = self.anchor.clone()
-        self.ball_anchor[..., 2] = 1.5
+        self.ball_anchor[..., 2] = 1.8
         
         self.init_drone_rpy_dist = D.Uniform(
             torch.tensor([-0.1, -0.1, 0.3], device=self.device) * torch.pi,
@@ -494,7 +494,8 @@ class MultiJuggleVolleyball(IsaacEnv):
                 "penalty_drone_too_close": UnboundedContinuousTensorSpec(1),
                 "penalty_yaw": UnboundedContinuousTensorSpec(1),
                 "penalty_roll": UnboundedContinuousTensorSpec(1),
-                "reward_pitch": UnboundedContinuousTensorSpec(1),
+                "penalty_pitch": UnboundedContinuousTensorSpec(1),
+                "soft_height_penalty": UnboundedContinuousTensorSpec(1),
 
                 "action_error_order1_mean": UnboundedContinuousTensorSpec(1),
                 "action_error_order1_max": UnboundedContinuousTensorSpec(1),
@@ -975,8 +976,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         # drone misbehave # 无人机违规行为
         drone_too_low = self.drone.pos[..., 2] < 0.5
         drone_too_high = self.drone.pos[..., 2] > 2.0
-        drone_too_far_y = (self.drone.pos[..., 1] - self.anchor[..., 1]).abs() > 1.0
-        drone_too_far_x = (self.drone.pos[..., 0] - self.anchor[..., 0]).abs() > 1.0
+        drone_too_far_y = (self.drone.pos[..., 1] - self.anchor[..., 1]).abs() > 1.5
+        drone_too_far_x = (self.drone.pos[..., 0] - self.anchor[..., 0]).abs() > 1.5
         drone_hit_net = self.check_hit_net(self.drone.pos, self.racket_radius)  # (E, 2) # 判断无人机是否触网
         drone_misbehave = drone_too_low | drone_too_high | drone_too_far_y | drone_too_far_x | drone_hit_net  # (E, 2) # 综合无人机的违规行为
 
@@ -1062,11 +1063,11 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         # task reward # 任务奖励
         _task_reward_coeff = 10.0  # 1.0,10.0 # 基础任务奖励系数
-        reward_success_hit = 2 * _task_reward_coeff * success_hit.any( # 成功击球奖励（全局共享，稀疏）
+        reward_success_hit = 5 * _task_reward_coeff * success_hit.any( # 成功击球奖励（全局共享，稀疏）
             -1, keepdim=True
         )  # share, sparse, (E, 1)
         reward_success_cross = ( # 成功过网奖励（全局共享，稀疏）
-            2 * _task_reward_coeff * true_cross.float() * cross_height_score
+            _task_reward_coeff * true_cross.float() * cross_height_score
         )  # share, sparse, (E, 1)
 
         _upward_ball_vel_reward_coeff = 20.0
@@ -1074,7 +1075,8 @@ class MultiJuggleVolleyball(IsaacEnv):
             _upward_ball_vel_reward_coeff
             * (
                 success_hit.any(-1, keepdim=True)
-                & (self.ball_linear_vel[..., 2] > 4.5)
+                & (self.ball_linear_vel[..., 2] > 4.0)
+                & (self.ball_linear_vel[..., 2] < 5.0)
             ).float()
         )  # share, sparse, (E, 1)
 
@@ -1084,12 +1086,13 @@ class MultiJuggleVolleyball(IsaacEnv):
             * (
                 success_hit.any(-1, keepdim=True)
                 & (self.ball_linear_vel[..., 1].abs() > 3.0)
+                & (self.ball_linear_vel[..., 1].abs() < 5.0)
             ).float()
         )  # share, sparse, (E, 1)
 
         _catch_height_reward_coeff = 10.0
-        _catch_height_target = 1.5
-        _catch_height_tolerance = 0.3
+        _catch_height_target = 1.6
+        _catch_height_tolerance = 0.4
         catch_height_score = (
             1.0
             - (self.drone.pos[..., 2] - _catch_height_target).abs()
@@ -1131,11 +1134,14 @@ class MultiJuggleVolleyball(IsaacEnv):
             _min_drone_dist - drone_dist
         ).clamp(min=0.0)  # share, dense, (E, 1)
 
-        _penalty_roll_coeff = 1.0
-        penalty_roll = _penalty_roll_coeff * success_hit.any(-1, keepdim=True).float() * (self.roll.abs() > 1.0).sum(-1, keepdim=True)
+        _penalty_roll_coeff = 0.2
+        penalty_roll = _penalty_roll_coeff * (self.pitch.abs() > 0.3).sum(-1, keepdim=True)
 
-        _reward_pitch_coeff = 1.0
-        reward_pitch = _reward_pitch_coeff * success_hit.any(-1, keepdim=True).float() * ((self.pitch.abs() < 1.0) & (self.pitch.abs() > 0.2)).sum(-1, keepdim=True)
+        _penalty_pitch_coeff = 0.2
+        penalty_pitch = _penalty_pitch_coeff * (self.pitch.abs() > 0.9).sum(-1, keepdim=True)
+
+        soft_height_penalty = (self.ball_pos[..., 2] - 3.0).clamp(min=0.0) / 0.4 
+        soft_height_penalty = 2.0 * soft_height_penalty # 最大附加 2.0 的软惩罚
 
         task_reward = (
             reward_success_hit
@@ -1145,15 +1151,16 @@ class MultiJuggleVolleyball(IsaacEnv):
             + reward_catch_height
             - penalty_dist_to_anchor
             - penalty_drone_too_close
-            + reward_pitch
+            + penalty_pitch
             - penalty_roll
+            - soft_height_penalty
         )
 
         # shaping reward # 引导成型奖励
         racket_center = self.get_racket_center()  # (E, 2, 3)
         dist_to_ball = torch.norm(racket_center - self.ball_pos, p=2, dim=-1)  # (E, 2)
         reward_dist_to_ball = ( # 靠近球的距离奖励
-            0.3 * _dist_coeff * current_turn_mask / (1 + dist_to_ball) # 仅给予当前回合的无人机靠近球的奖励
+            0.1 * _dist_coeff * current_turn_mask / (1 + dist_to_ball) # 仅给予当前回合的无人机靠近球的奖励
         )  # individual, dense, (E, 2)
         reward_drone_dist_to_ball = reward_dist_to_ball.clone()
         reward_dist_to_ball = reward_dist_to_ball.sum( # 对当前回合无人机的距离奖励求和
@@ -1162,7 +1169,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         ball_dist_to_anchor = torch.norm(self.ball_pos - self.ball_anchor, p=2, dim=-1)  # (E, 2)
         reward_ball_to_anchor = (
-            0.3 * _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
+            0.4 * _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
         )  # individual, dense, (E, 2)
         reward_drone_ball_to_anchor = reward_ball_to_anchor.clone()
         reward_ball_to_anchor = reward_ball_to_anchor.sum(
@@ -1296,7 +1303,8 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.stats["reward_action_smoothness"].add_(reward_action_smoothness.mean(dim=-1, keepdim=True)) # 累积动作平滑度奖励
         self.stats["penalty_yaw"].add_(penalty_yaw.mean(dim=-1, keepdim=True)) # 累积偏航惩罚
         self.stats["penalty_roll"].add_(penalty_roll.mean(dim=-1, keepdim=True)) # 累积横滚惩罚
-        self.stats["reward_pitch"].add_(reward_pitch.mean(dim=-1, keepdim=True)) # 累积俯仰奖励
+        self.stats["penalty_pitch"].add_(penalty_pitch.mean(dim=-1, keepdim=True)) # 累积俯仰奖励
+        self.stats["soft_height_penalty"].add_(soft_height_penalty.mean(dim=-1, keepdim=True)) # 累积软高度惩罚
 
 
         if self.reward_shaping: # 如果启用了成型引导奖励

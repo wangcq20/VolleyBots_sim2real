@@ -9,7 +9,7 @@ defaults:
 ball_mass: 0.005 # kg
 ball_radius: 0.1 # m
 anchor: [[4.5, -1.5, 1.0], [4.5, 1.5, 1.0]]
-anchor_radius: 0.4
+anchor_radius: 0.5
 min_height: 2.2
 reward_shaping: true
 init_drone_pos_dist: # relative to anchor
