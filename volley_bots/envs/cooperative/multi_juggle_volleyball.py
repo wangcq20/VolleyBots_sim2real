@@ -1070,11 +1070,25 @@ class MultiJuggleVolleyball(IsaacEnv):
             _task_reward_coeff * true_cross.float() * cross_height_score
         )  # share, sparse, (E, 1)
 
+        target_dir_xy = ( # 目标方向（从当前回合无人机指向对方无人机的 XY 向量）
+            self.drone.pos[turn_to_mask(self.turn)]
+            - self.drone.pos[turn_to_mask(~self.turn)]
+        )[
+            ..., :2
+        ]  # (E, 2)
+        ball_dir_xy = self.ball_vel[:, 0, :2]  # (E, 2) # 球速度向量的 XY 分量
+        cosine_similarity = NNF.cosine_similarity( # 计算目标方向与球速方向的余弦相似度
+            target_dir_xy, ball_dir_xy, dim=-1
+        ).unsqueeze(
+            -1
+        )  # (E, 1)
+
         _upward_ball_vel_reward_coeff = 20.0
         reward_upward_ball_vel = (
             _upward_ball_vel_reward_coeff
             * (
                 success_hit.any(-1, keepdim=True)
+                & (cosine_similarity > 0.0)
                 & (self.ball_linear_vel[..., 2] > 4.0)
                 & (self.ball_linear_vel[..., 2] < 5.0)
             ).float()
@@ -1085,6 +1099,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             _toward_ball_vel_reward_coeff
             * (
                 success_hit.any(-1, keepdim=True)
+                & (cosine_similarity > 0.0)
                 & (self.ball_linear_vel[..., 1].abs() > 3.0)
                 & (self.ball_linear_vel[..., 1].abs() < 5.0)
             ).float()
@@ -1116,14 +1131,13 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         _dist_coeff = 2.0  # 0.05,0.03 # 距离惩罚系数
         current_turn_mask = turn_to_mask(self.turn).float()  # (E, 2)
-        return_to_anchor_mask = 1.0 - current_turn_mask  # (E, 2)
         dist_to_anchor = torch.norm(self.drone.pos - self.anchor, p=2, dim=-1)  # (E, 2) # 计算无人机到锚点（防守位）的距离
-        penalty_dist_to_anchor = _dist_coeff * return_to_anchor_mask * ( # 仅对非当前回合的无人机进行距离锚点过远的惩罚
+        penalty_dist_to_anchor = _dist_coeff * ( # 任意时刻均对距离锚点过远的无人机进行惩罚
             dist_to_anchor - self.anchor_radius
         ).clamp(min=0)  # individual, sparse, (E, 2)
-        penalty_dist_to_anchor = penalty_dist_to_anchor.sum( # 求非当前回合无人机的平均惩罚作为共享惩罚
+        penalty_dist_to_anchor = penalty_dist_to_anchor.mean( # 求所有无人机的平均惩罚作为共享惩罚
             -1, keepdim=True
-        ) / return_to_anchor_mask.sum(-1, keepdim=True).clamp(min=1.0)  # share, sparse, (E, 1)
+        )  # share, sparse, (E, 1)
 
         _penalty_drone_too_close_coeff = 10.0
         _min_drone_dist = 1.0
@@ -1169,7 +1183,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         ball_dist_to_anchor = torch.norm(self.ball_pos - self.ball_anchor, p=2, dim=-1)  # (E, 2)
         reward_ball_to_anchor = (
-            0.4 * _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
+            0.5 * _dist_coeff * current_turn_mask / (1 + ball_dist_to_anchor)
         )  # individual, dense, (E, 2)
         reward_drone_ball_to_anchor = reward_ball_to_anchor.clone()
         reward_ball_to_anchor = reward_ball_to_anchor.sum(
@@ -1177,18 +1191,6 @@ class MultiJuggleVolleyball(IsaacEnv):
         ) / current_turn_mask.sum(-1, keepdim=True).clamp(min=1.0)  # share, dense, (E, 1)
 
         _direction_reward_coeff = 1.0 # 方向奖励系数
-        target_dir_xy = ( # 目标方向（从当前回合无人机指向对方无人机的 XY 向量）
-            self.drone.pos[turn_to_mask(self.turn)]
-            - self.drone.pos[turn_to_mask(~self.turn)]
-        )[
-            ..., :2
-        ]  # (E, 2)
-        ball_dir_xy = self.ball_vel[:, 0, :2]  # (E, 2) # 球速度向量的 XY 分量
-        cosine_similarity = NNF.cosine_similarity( # 计算目标方向与球速方向的余弦相似度
-            target_dir_xy, ball_dir_xy, dim=-1
-        ).unsqueeze(
-            -1
-        )  # (E, 1)
         reward_hit_direction = ( # 击球方向奖励 = 系数 * 成功击球 * 余弦相似度
             _direction_reward_coeff * success_hit * cosine_similarity
         )  # individual, sparse, (E, 2)

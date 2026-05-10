@@ -1,4 +1,4 @@
-total_frames=2_000_000_000
+total_frames=3_000_000_000
 algorithm="mappo"  # mappo, maddpg, happo, mat, qmix
 seed=0  # 0, 1, 2
 
