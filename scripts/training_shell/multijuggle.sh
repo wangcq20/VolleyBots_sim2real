@@ -1,4 +1,4 @@
-total_frames=3_500_000_000
+total_frames=4_000_000_000
 algorithm="mappo"  # mappo, maddpg, happo, mat, qmix
 seed=0  # 0, 1, 2
 
@@ -11,8 +11,8 @@ CUDA_VISIBLE_DEVICES=0 python ../train.py headless=true \
     task.ball_mass=0.05 \
     task.ball_radius=0.1 \
     task.reward_action_smoothness_weight=0.02 \
-    eval_interval=500 \
-    save_interval=500 \
+    eval_interval=1000 \
+    save_interval=1000 \
     algo=${algorithm} \
     seed=${seed} \
     algo.critic_input=state \
