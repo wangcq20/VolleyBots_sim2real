@@ -294,6 +294,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         self.id[:, 1, 1] = 1
         
         self.ball_last_vel = torch.zeros((self.num_envs, 1, 3), device=self.device)
+        self.prev_obs_ball_vel = torch.zeros((self.num_envs, 1, 3), device=self.device)
         self.ball_peak_height = torch.zeros((self.num_envs, 1), device=self.device)
         self.last_linear_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
         self.last_angular_v = torch.zeros(self.num_envs, self.num_drones, device=self.device)
@@ -316,7 +317,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         material = materials.PhysicsMaterial(
             prim_path="/World/Physics_Materials/physics_material_0",
-            restitution=0.6,
+            restitution=0.7,
         )
 
         ball = objects.DynamicSphere(
@@ -750,6 +751,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         
 
         self.ball_last_vel[env_ids] = torch.zeros_like(self.ball_last_vel[env_ids])
+        self.prev_obs_ball_vel[env_ids] = torch.zeros_like(self.prev_obs_ball_vel[env_ids])
         self.last_linear_v[env_ids] = torch.zeros_like(self.last_linear_v[env_ids])
         self.last_angular_v[env_ids] = torch.zeros_like(self.last_angular_v[env_ids])
         self.last_linear_a[env_ids] = torch.zeros_like(self.last_linear_a[env_ids])
@@ -855,21 +857,35 @@ class MultiJuggleVolleyball(IsaacEnv):
             dim=1,
         )  # (E,2,3)
 
-        rpos_anchor = self.drone.pos - self.anchor  # (E,2,3)
+        obs_pos = pos + torch.empty_like(pos).uniform_(-0.015, 0.015)
+        obs_ball_pos = self.ball_pos + torch.empty_like(self.ball_pos).uniform_(-0.015, 0.015)
+        obs_vel = vel + torch.empty_like(vel).uniform_(-0.05, 0.05)
+        current_obs_ball_vel = self.ball_vel + torch.empty_like(self.ball_vel).uniform_(-0.05, 0.05)
+        obs_ball_vel = self.prev_obs_ball_vel.clone()
+
+        obs_rpos_anchor = obs_pos - self.anchor  # (E,2,3)
+        obs_rpos_drone = torch.stack(
+            [
+                obs_pos[..., 1, :] - obs_pos[..., 0, :],
+                obs_pos[..., 0, :] - obs_pos[..., 1, :],
+            ],
+            dim=1,
+        )  # (E,2,3)
+        obs_rpos_ball = obs_pos - obs_ball_pos  # (E,2,3)
 
         obs = [
-            pos,
+            obs_pos,
             # rot, # w of (w,x,y,z) is positive
-            vel,
+            obs_vel,
             # angular_vel,
             heading,
             lateral, # [E, 1, 3]
             up,
-            self.ball_pos.expand(-1, 2, 3), #(E,2,3)
-            rpos_anchor,  # (E,2,3)
-            self.rpos_drone[..., :3],  # (E,2,3)
-            self.rpos_ball,  # (E,2,3)
-            self.ball_vel.expand(-1, 2, 3),  # (E,2,3)
+            obs_ball_pos.expand(-1, 2, 3), #(E,2,3)
+            obs_rpos_anchor,  # (E,2,3)
+            obs_rpos_drone[..., :3],  # (E,2,3)
+            obs_rpos_ball,  # (E,2,3)
+            obs_ball_vel.expand(-1, 2, 3),  # (E,2,3)
             turn_to_obs(self.turn),  # (E,2,2)
             self.id,  # (E,2,2)
         ]
@@ -881,6 +897,7 @@ class MultiJuggleVolleyball(IsaacEnv):
             obs.append(t.expand(-1, 2, self.time_encoding_dim))
 
         obs = torch.cat(obs, dim=-1)
+        self.prev_obs_ball_vel = current_obs_ball_vel.clone()
         t = (self.progress_buf / self.max_episode_length).unsqueeze(-1)
         state = torch.concat([obs.mean(dim=1, keepdim=True), t.expand(-1, self.time_encoding_dim).unsqueeze(1)], dim=-1).squeeze(1)
 
@@ -1100,8 +1117,8 @@ class MultiJuggleVolleyball(IsaacEnv):
             * (
                 success_hit.any(-1, keepdim=True)
                 & (cosine_similarity > 0.0)
-                & (self.ball_linear_vel[..., 1].abs() > 3.0)
-                & (self.ball_linear_vel[..., 1].abs() < 5.0)
+                & (self.ball_linear_vel[..., 1].abs() > 2.5)
+                & (self.ball_linear_vel[..., 1].abs() < 4.0)
             ).float()
         )  # share, sparse, (E, 1)
 
