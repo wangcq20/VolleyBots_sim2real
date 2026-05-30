@@ -272,8 +272,9 @@ class MultiJuggleVolleyball(IsaacEnv):
             torch.tensor(cfg.task.init_drone_pos_dist.high, device=self.device)
             + self.anchor,
         )
-        self.ball_anchor = self.anchor.clone()
-        self.ball_anchor[..., 2] = 1.8
+        self.ball_anchor_init = self.anchor.clone()
+        self.ball_anchor_init[..., 2] = 1.8
+        self.ball_anchor = self.ball_anchor_init.expand(self.num_envs, -1, -1).clone()
         
         self.init_drone_rpy_dist = D.Uniform(
             torch.tensor([-0.1, -0.1, 0.3], device=self.device) * torch.pi,
@@ -317,7 +318,7 @@ class MultiJuggleVolleyball(IsaacEnv):
 
         material = materials.PhysicsMaterial(
             prim_path="/World/Physics_Materials/physics_material_0",
-            restitution=0.7,
+            restitution=0.85,
         )
 
         ball = objects.DynamicSphere(
@@ -726,6 +727,11 @@ class MultiJuggleVolleyball(IsaacEnv):
         # ball and turn
         turn = torch.zeros(len(env_ids), 1, device=self.device, dtype=torch.int64)
         self.turn[env_ids] = turn
+        ball_anchor_xy_noise = torch.empty(
+            len(env_ids), self.num_drones, 2, device=self.device
+        ).uniform_(-0.2, 0.2)
+        self.ball_anchor[env_ids] = self.ball_anchor_init.unsqueeze(0)
+        self.ball_anchor[env_ids, ..., :2] += ball_anchor_xy_noise
 
         ball_pos = (
             drone_pos[turn_to_mask(turn)] + self.init_ball_offset
@@ -863,7 +869,7 @@ class MultiJuggleVolleyball(IsaacEnv):
         current_obs_ball_vel = self.ball_vel + torch.empty_like(self.ball_vel).uniform_(-0.05, 0.05)
         obs_ball_vel = self.prev_obs_ball_vel.clone()
 
-        obs_rpos_anchor = obs_pos - self.anchor  # (E,2,3)
+        obs_rpos_anchor = obs_pos - self.ball_anchor  # (E,2,3)
         obs_rpos_drone = torch.stack(
             [
                 obs_pos[..., 1, :] - obs_pos[..., 0, :],

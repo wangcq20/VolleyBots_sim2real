@@ -18,4 +18,4 @@ CUDA_VISIBLE_DEVICES=0 python ../train.py headless=true \
     algo.critic_input=state \
     wandb.mode=online \
     wandb.project=multijuggle \
-    wandb.run_name=multijuggle_ctbr_restitution0.7 \
+    wandb.run_name=multijuggle_ctbr_restitution0.85_BallAnchorRandom \
